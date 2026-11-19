@@ -31,6 +31,7 @@ log = logging.getLogger("amarok_ytmusic.server")
 
 WEB_DIR = Path(__file__).parent / "web"
 CHUNK_SIZE = 65536
+UPSTREAM_RANGE_CHUNK = 512 * 1024  # 512 KiB chunks bypass YouTube single-stream CDN throttling
 
 
 class BrowserExtractRequest(BaseModel):
@@ -415,24 +416,89 @@ def create_app(
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    async def _open_upstream(video_id: str, method: str, range_header: str | None) -> tuple[httpx.Response, str]:
+    async def _probe_stream_length(video_id: str) -> tuple[Any, int | None, str]:
+        """Resolve stream metadata and ensure total content_length is known for chunked Range fetching."""
         assert http_client is not None
         for attempt in range(2):
             stream = await resolver.resolve(video_id, force_refresh=(attempt == 1))
+            if stream.content_length and stream.content_length > 0:
+                return stream, stream.content_length, stream.content_type
+
             upstream_headers = {
                 k: v for k, v in stream.http_headers.items() if k.lower() not in ("host", "accept-encoding")
             }
-            if range_header:
-                upstream_headers["Range"] = range_header
-            req = http_client.build_request(method, stream.url, headers=upstream_headers)
-            resp = await http_client.send(req, stream=True)
+            resp = await http_client.head(stream.url, headers=upstream_headers)
             if resp.status_code in (403, 410) and attempt == 0:
-                await resp.aclose()
                 resolver.invalidate(video_id)
-                log.info("Upstream returned %d for %s; refreshing resolved stream URL", resp.status_code, video_id)
                 continue
-            return resp, stream.content_type
-        raise StreamResolutionError(f"Upstream rejected stream for {video_id}")
+            cl = resp.headers.get("content-length")
+            mime = resp.headers.get("content-type") or stream.content_type
+            total = int(cl) if (cl and cl.isdigit()) else None
+            if total:
+                stream.content_length = total
+            return stream, total, mime
+        raise StreamResolutionError(f"Upstream rejected stream probe for {video_id}")
+
+    async def _fetch_upstream_chunk(
+        video_id: str,
+        start: int,
+        end: int,
+    ) -> tuple[bytes, str]:
+        """Fetch an exact byte range from YouTube's CDN with automatic URL refresh & retry."""
+        assert http_client is not None
+        last_err: Exception | None = None
+        for attempt in range(3):
+            stream = await resolver.resolve(video_id, force_refresh=(attempt > 0))
+            upstream_headers = {
+                k: v for k, v in stream.http_headers.items() if k.lower() not in ("host", "accept-encoding")
+            }
+            upstream_headers["Range"] = f"bytes={start}-{end}"
+            try:
+                resp = await http_client.get(stream.url, headers=upstream_headers)
+                if resp.status_code in (403, 410) and attempt < 2:
+                    resolver.invalidate(video_id)
+                    log.info("Upstream returned %d on chunk %d-%d for %s; refreshing URL", resp.status_code, start, end, video_id)
+                    continue
+                if resp.status_code in (200, 206):
+                    data = resp.content
+                    mime = resp.headers.get("content-type") or stream.content_type
+                    # Guard against upstream returning full body (200) instead of slice (206)
+                    if resp.status_code == 200 and (start > 0 or len(data) > (end - start + 1)):
+                        data = data[start : end + 1]
+                    if data:
+                        return data, mime
+                last_err = RuntimeError(f"Upstream HTTP {resp.status_code}")
+            except httpx.HTTPError as exc:
+                last_err = exc
+                log.warning("Upstream chunk %d-%d failed for %s (attempt %d): %s", start, end, video_id, attempt + 1, exc)
+                if attempt == 1:
+                    resolver.invalidate(video_id)
+                await asyncio.sleep(0.15 * (attempt + 1))
+        raise StreamResolutionError(f"Failed fetching chunk {start}-{end} for {video_id}: {last_err}")
+
+    def _parse_range_header(range_header: str | None, total_size: int) -> tuple[int, int, bool] | None:
+        """Parse an HTTP Range header into (start, end, is_partial), or None if unsatisfiable."""
+        if not range_header or not range_header.startswith("bytes="):
+            return 0, total_size - 1, False
+        spec = range_header.replace("bytes=", "", 1).split(",")[0].strip()
+        if "-" not in spec:
+            return 0, total_size - 1, False
+        start_s, end_s = spec.split("-", 1)
+        try:
+            if start_s:
+                start = int(start_s)
+                end = int(end_s) if end_s else total_size - 1
+            elif end_s:
+                suffix = int(end_s)
+                start = max(0, total_size - suffix)
+                end = total_size - 1
+            else:
+                return 0, total_size - 1, False
+        except ValueError:
+            return 0, total_size - 1, False
+        if start < 0 or start >= total_size or start > end:
+            return None
+        return start, min(end, total_size - 1), True
 
     @app.api_route("/stream/{video_id}", methods=["GET", "HEAD"])
     async def stream_audio(video_id: str, request: Request) -> Response:
@@ -444,30 +510,82 @@ def create_app(
             if settings.auto_import_metadata:
                 asyncio.create_task(importer.on_track_played(video_id, record_play=False))
 
-        range_header = request.headers.get("range")
         try:
-            upstream, fallback_mime = await _open_upstream(video_id, request.method, range_header)
+            stream, total_size, media_type = await _probe_stream_length(video_id)
         except StreamResolutionError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except httpx.HTTPError as exc:
             raise HTTPException(status_code=502, detail=f"Upstream network error: {exc}") from exc
 
-        resp_headers: dict[str, str] = {
-            "Accept-Ranges": upstream.headers.get("accept-ranges", "bytes"),
-            "Cache-Control": "no-store",
+        range_header = request.headers.get("range")
+
+        # Fast path: chunked 512 KiB Range fetching (bypasses YouTube single-stream throttling & pause timeouts!)
+        if total_size and total_size > 0:
+            parsed = _parse_range_header(range_header, total_size)
+            if parsed is None:
+                return Response(status_code=416, headers={"Content-Range": f"bytes */{total_size}"})
+            req_start, req_end, is_partial = parsed
+            expected_len = req_end - req_start + 1
+
+            resp_headers: dict[str, str] = {
+                "Accept-Ranges": "bytes",
+                "Cache-Control": "no-store",
+                "Content-Length": str(expected_len),
+            }
+            if is_partial:
+                resp_headers["Content-Range"] = f"bytes {req_start}-{req_end}/{total_size}"
+            status_code = 206 if is_partial else 200
+
+            if request.method == "HEAD":
+                return Response(status_code=status_code, headers=resp_headers, media_type=media_type)
+
+            # Prefetch the very first chunk BEFORE sending 200/206 headers so if the cached URL expired (403)
+            # or fails completely we can still refresh cleanly or return a proper HTTP error status!
+            first_end = min(req_start + UPSTREAM_RANGE_CHUNK - 1, req_end)
+            try:
+                first_chunk, chunk_mime = await _fetch_upstream_chunk(video_id, req_start, first_end)
+                if chunk_mime:
+                    media_type = chunk_mime
+            except StreamResolutionError as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+            async def chunked_body_iter():
+                yield first_chunk
+                cursor = req_start + len(first_chunk)
+                while cursor <= req_end:
+                    c_end = min(cursor + UPSTREAM_RANGE_CHUNK - 1, req_end)
+                    data, _ = await _fetch_upstream_chunk(video_id, cursor, c_end)
+                    yield data
+                    cursor += len(data)
+
+            return StreamingResponse(
+                chunked_body_iter(),
+                status_code=status_code,
+                headers=resp_headers,
+                media_type=media_type,
+            )
+
+        # Fallback when total content_length is unknown (e.g., live stream)
+        assert http_client is not None
+        upstream_headers = {
+            k: v for k, v in stream.http_headers.items() if k.lower() not in ("host", "accept-encoding")
         }
-        for h in ("content-length", "content-range"):
-            if h in upstream.headers:
-                resp_headers[h.title()] = upstream.headers[h]
+        if range_header:
+            upstream_headers["Range"] = range_header
+        try:
+            req = http_client.build_request(request.method, stream.url, headers=upstream_headers)
+            upstream = await http_client.send(req, stream=True)
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"Upstream network error: {exc}") from exc
 
-        media_type = upstream.headers.get("content-type") or fallback_mime
-
+        fb_headers = {"Accept-Ranges": upstream.headers.get("accept-ranges", "bytes"), "Cache-Control": "no-store"}
+        fb_mime = upstream.headers.get("content-type") or media_type
         if request.method == "HEAD":
-            status_code = upstream.status_code
+            st = upstream.status_code
             await upstream.aclose()
-            return Response(status_code=status_code, headers=resp_headers, media_type=media_type)
+            return Response(status_code=st, headers=fb_headers, media_type=fb_mime)
 
-        async def body_iter():
+        async def fallback_iter():
             try:
                 async for chunk in upstream.aiter_bytes(chunk_size=CHUNK_SIZE):
                     yield chunk
@@ -477,10 +595,10 @@ def create_app(
                 await upstream.aclose()
 
         return StreamingResponse(
-            body_iter(),
+            fallback_iter(),
             status_code=upstream.status_code,
-            headers=resp_headers,
-            media_type=media_type,
+            headers=fb_headers,
+            media_type=fb_mime,
         )
 
     return app

@@ -72,7 +72,9 @@ def test_stream_proxy_supports_range_and_head(tmp_path: Path, monkeypatch: pytes
     app.state.resolver.resolve = AsyncMock(side_effect=fake_resolve)
 
     # Patch httpx.AsyncClient.send to serve fake_audio with HTTP Range support
-    async def mock_send(self: httpx.AsyncClient, request: httpx.Request, *, stream: bool = False) -> httpx.Response:
+    async def mock_send(
+        self: httpx.AsyncClient, request: httpx.Request, **kwargs
+    ) -> httpx.Response:
         rng = request.headers.get("range")
         if rng and rng.startswith("bytes="):
             start_s, end_s = rng.replace("bytes=", "").split("-")
@@ -148,7 +150,9 @@ def test_stream_proxy_retries_on_upstream_403(tmp_path: Path, monkeypatch: pytes
 
     app.state.resolver.resolve = AsyncMock(side_effect=fake_resolve)
 
-    async def mock_send(self: httpx.AsyncClient, request: httpx.Request, *, stream: bool = False) -> httpx.Response:
+    async def mock_send(
+        self: httpx.AsyncClient, request: httpx.Request, **kwargs
+    ) -> httpx.Response:
         if "expired.webm" in str(request.url):
             return httpx.Response(403, content=b"", request=request)
         return httpx.Response(
@@ -164,4 +168,59 @@ def test_stream_proxy_retries_on_upstream_403(tmp_path: Path, monkeypatch: pytes
         r = client.get("/stream/dQw4w9WgXcQ")
         assert r.status_code == 200
         assert r.content == b"OK!!"
-        assert resolve_calls == [False, True]
+        assert resolve_calls[-1] is True
+        assert False in resolve_calls
+
+
+def test_stream_proxy_assembles_multiple_upstream_range_chunks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import amarok_ytmusic.server as server_mod
+
+    monkeypatch.setattr(server_mod, "UPSTREAM_RANGE_CHUNK", 10)
+    store = SettingsStore(config_dir=tmp_path / "cfg")
+    settings = store.load()
+    settings.auto_import_metadata = False
+    store.save(settings)
+    app = create_app(store=store, ipc_dir=tmp_path / "ipc", enable_ipc=False, enable_mpris=False)
+
+    fake_audio = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+    async def fake_resolve(video_id: str, force_refresh: bool = False) -> ResolvedStream:
+        return ResolvedStream(
+            video_id=video_id,
+            url="https://mock-googlevideo.local/chunked.webm",
+            content_type="audio/webm",
+            content_length=len(fake_audio),
+            expires_at=9999999999.0,
+        )
+
+    app.state.resolver.resolve = AsyncMock(side_effect=fake_resolve)
+    seen_ranges: list[str] = []
+
+    async def mock_send(
+        self: httpx.AsyncClient, request: httpx.Request, **kwargs
+    ) -> httpx.Response:
+        rng = request.headers.get("range", "")
+        seen_ranges.append(rng)
+        start_s, end_s = rng.replace("bytes=", "").split("-")
+        start, end = int(start_s), int(end_s)
+        chunk = fake_audio[start : end + 1]
+        return httpx.Response(
+            206,
+            content=chunk,
+            headers={
+                "Content-Type": "audio/webm",
+                "Content-Range": f"bytes {start}-{end}/{len(fake_audio)}",
+                "Content-Length": str(len(chunk)),
+            },
+            request=request,
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "send", mock_send)
+
+    with TestClient(app) as client:
+        r = client.get("/stream/dQw4w9WgXcQ")
+        assert r.status_code == 200
+        assert r.content == fake_audio
+        assert seen_ranges == ["bytes=0-9", "bytes=10-19", "bytes=20-29", "bytes=30-35"]
