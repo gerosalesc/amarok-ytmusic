@@ -361,12 +361,26 @@ class TrackImporter:
 
             self.store.set_local_file_path(video_id, str(dest))
             track.local_file_path = str(dest)
+            self._notify_amarok_watcher(dest)
             log.info("Imported tagged track into Amarok Local Collection: %s", dest)
             self._enforce_cache_limit()
             return track
         finally:
             if downloaded.exists():
                 downloaded.unlink(missing_ok=True)
+
+    def _notify_amarok_watcher(self, audio_path: Path) -> None:
+        """Bump mtimes up to ~/Music so Amarok's KDirWatch scans the new/updated track within ~2s."""
+        settings = self.auth.get_settings()
+        base = settings.resolved_collection_dir()
+        now = time.time()
+        targets = [audio_path, audio_path.parent, base, base.parent]
+        for p in targets:
+            try:
+                if p.exists():
+                    os.utime(p, (now, now))
+            except OSError:
+                pass
 
     def sync_tags_for_track_sync(self, video_id: str) -> bool:
         """Re-write updated rating/playcount/score tags onto an already-imported local .m4a file."""
@@ -376,7 +390,10 @@ class TrackImporter:
         p = Path(track.local_file_path)
         if not p.exists() or p.suffix.lower() not in (".m4a", ".mp4"):
             return False
-        return write_mp4_tags(p, track)
+        ok = write_mp4_tags(p, track)
+        if ok:
+            self._notify_amarok_watcher(p)
+        return ok
 
     async def on_track_played(
         self,

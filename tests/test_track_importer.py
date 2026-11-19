@@ -68,13 +68,12 @@ def test_fetch_and_cache_metadata_sync(tmp_path: Path, monkeypatch: pytest.Monke
     assert fake_yt.get_watch_playlist.call_count == 1
 
 
-def test_stream_endpoint_serves_locally_cached_file_with_range(tmp_path: Path) -> None:
+def test_api_cache_tracks_reports_local_file_status(tmp_path: Path) -> None:
     store = SettingsStore(config_dir=tmp_path / "cfg")
     app = create_app(store=store, ipc_dir=tmp_path / "ipc", enable_ipc=False, enable_mpris=False)
 
     fake_audio_file = tmp_path / "cached.m4a"
-    payload = b"M4A_FAKE_AUDIO_BYTES_0123456789" * 100
-    fake_audio_file.write_bytes(payload)
+    fake_audio_file.write_bytes(b"M4A_FAKE_AUDIO_BYTES_0123456789" * 100)
 
     app.state.metadata_store.upsert_metadata(
         CachedTrack(
@@ -87,16 +86,6 @@ def test_stream_endpoint_serves_locally_cached_file_with_range(tmp_path: Path) -
     )
 
     with TestClient(app) as client:
-        r_head = client.head("/stream/5gXrbaDHMrM")
-        assert r_head.status_code == 200
-        assert r_head.headers["content-length"] == str(len(payload))
-        assert r_head.headers["accept-ranges"] == "bytes"
-
-        r_range = client.get("/stream/5gXrbaDHMrM", headers={"Range": "bytes=0-19"})
-        assert r_range.status_code == 206
-        assert r_range.content == payload[:20]
-        assert r_range.headers["content-range"] == f"bytes 0-19/{len(payload)}"
-
         r_cache = client.get("/api/cache/tracks")
         assert r_cache.status_code == 200
         body = r_cache.json()

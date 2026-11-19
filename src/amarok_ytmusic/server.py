@@ -436,16 +436,9 @@ def create_app(
 
     @app.api_route("/stream/{video_id}", methods=["GET", "HEAD"])
     async def stream_audio(video_id: str, request: Request) -> Response:
-        # 1. Serve directly from cached local collection file if already imported (instant seek, zero latency)
-        cached = metadata_store.get_track(video_id)
-        if cached and cached.local_file_path:
-            local_p = Path(cached.local_file_path)
-            if local_p.exists() and local_p.stat().st_size > 1000:
-                if request.method == "GET" and not metadata_store.is_metadata_fresh(cached):
-                    asyncio.create_task(importer.on_track_played(video_id, record_play=False))
-                return _serve_local_file_with_range(local_p, request)
-
-        # 2. Kick off background metadata + Local Collection import whenever Amarok begins playing a track
+        # Kick off background metadata + Local Collection import whenever Amarok plays an Ampache stream.
+        # Note: Keep /stream/{video_id} streaming raw upstream audio (instead of the tagged local .m4a)
+        # so Amarok's GStreamer MetaStream::Track doesn't misinterpret embedded MP4 tags as a 0:00 live radio stream.
         if request.method == "GET":
             settings = settings_store.load()
             if settings.auto_import_metadata:
