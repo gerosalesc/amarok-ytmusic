@@ -1,0 +1,680 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Amarok × YouTube Music — Web Auth & Control</title>
+  <style>
+    :root {
+      --bg: #14171c;
+      --surface: #1d222a;
+      --surface-2: #252b35;
+      --border: #323a47;
+      --text: #eef1f5;
+      --muted: #9aa5b4;
+      --accent: #ff2a55;
+      --accent-hover: #ff476c;
+      --kde-blue: #3daee9;
+      --ok: #2ecc71;
+      --warn: #f1c40f;
+      --err: #e74c3c;
+      --radius: 12px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Noto Sans", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: radial-gradient(circle at top right, #231828 0%, var(--bg) 55%);
+      color: var(--text);
+      min-height: 100vh;
+      padding: 28px 18px 60px;
+    }
+    .container {
+      max-width: 860px;
+      margin: 0 auto;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+    .logo {
+      width: 44px;
+      height: 44px;
+      border-radius: 12px;
+      background: linear-gradient(135deg, var(--accent), #b81d4a);
+      display: grid;
+      place-items: center;
+      font-size: 22px;
+      font-weight: 700;
+      box-shadow: 0 6px 20px rgba(255, 42, 85, 0.35);
+    }
+    h1 { margin: 0; font-size: 1.35rem; }
+    .subtitle { margin: 2px 0 0; color: var(--muted); font-size: 0.9rem; }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+    }
+    .dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--warn);
+    }
+    .dot.ok { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+    .dot.err { background: var(--err); }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+    }
+    .card h2 {
+      margin: 0 0 14px;
+      font-size: 1.08rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .account-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      flex-wrap: wrap;
+      padding: 14px;
+      border-radius: 10px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+    }
+    .account-info {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .avatar {
+      width: 44px;
+      height: 44px;
+      border-radius: 50%;
+      object-fit: cover;
+      background: #333;
+      display: none;
+    }
+    .tabs {
+      display: flex;
+      gap: 8px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 12px;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+    }
+    .tab-btn {
+      background: var(--surface-2);
+      color: var(--muted);
+      border: 1px solid var(--border);
+      padding: 8px 14px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 0.88rem;
+      transition: all 0.15s;
+    }
+    .tab-btn.active {
+      background: var(--accent);
+      color: #fff;
+      border-color: var(--accent);
+    }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+    .row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+    label {
+      display: block;
+      font-size: 0.82rem;
+      color: var(--muted);
+      margin-bottom: 5px;
+      font-weight: 600;
+    }
+    input, select, textarea {
+      width: 100%;
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 9px 11px;
+      font-family: inherit;
+      font-size: 0.92rem;
+    }
+    textarea {
+      min-height: 130px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.82rem;
+      resize: vertical;
+    }
+    .actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+      margin-top: 12px;
+    }
+    button.primary, a.btn {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      padding: 9px 16px;
+      border-radius: 8px;
+      font-weight: 600;
+      font-size: 0.9rem;
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    button.primary:hover, a.btn:hover { background: var(--accent-hover); }
+    button.secondary, a.btn.secondary {
+      background: var(--surface-2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      padding: 9px 15px;
+      border-radius: 8px;
+      font-weight: 600;
+      font-size: 0.88rem;
+      cursor: pointer;
+      text-decoration: none;
+    }
+    button.secondary:hover, a.btn.secondary:hover { border-color: var(--kde-blue); }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    .banner {
+      margin-top: 12px;
+      padding: 11px 13px;
+      border-radius: 8px;
+      font-size: 0.88rem;
+      display: none;
+      line-height: 1.45;
+    }
+    .banner.show { display: block; }
+    .banner.ok { background: rgba(46, 204, 113, 0.14); border: 1px solid rgba(46, 204, 113, 0.45); color: #b9f6ca; }
+    .banner.err { background: rgba(231, 76, 60, 0.14); border: 1px solid rgba(231, 76, 60, 0.45); color: #ffcdd2; }
+    .banner.info { background: rgba(61, 174, 233, 0.14); border: 1px solid rgba(61, 174, 233, 0.45); color: #cceeff; }
+    .steps {
+      margin: 0 0 14px;
+      padding-left: 18px;
+      color: var(--muted);
+      font-size: 0.88rem;
+      line-height: 1.6;
+    }
+    .steps strong { color: var(--text); }
+    .oauth-code-box {
+      display: none;
+      margin-top: 14px;
+      padding: 14px;
+      border-radius: 10px;
+      background: var(--surface-2);
+      border: 1px dashed var(--kde-blue);
+    }
+    .code-big {
+      font-family: ui-monospace, monospace;
+      font-size: 1.5rem;
+      letter-spacing: 3px;
+      font-weight: 700;
+      color: var(--kde-blue);
+      margin: 8px 0;
+    }
+    .track-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-top: 12px;
+    }
+    .track-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+    }
+    .track-meta { display: flex; align-items: center; gap: 10px; min-width: 0; }
+    .track-thumb { width: 42px; height: 42px; border-radius: 6px; object-fit: cover; flex-shrink: 0; background: #111; }
+    .track-title { font-weight: 600; font-size: 0.92rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .track-sub { color: var(--muted); font-size: 0.82rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    audio { width: 100%; margin-top: 12px; display: none; }
+    code { background: var(--bg); padding: 2px 6px; border-radius: 5px; font-size: 0.84rem; color: var(--kde-blue); }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="brand">
+        <div class="logo">▶</div>
+        <div>
+          <h1>Amarok × YouTube Music</h1>
+          <p class="subtitle">Local Web Auth & Streaming Bridge for Amarok 3.3+ on KDE</p>
+        </div>
+      </div>
+      <div class="pill" id="statusPill">
+        <span class="dot" id="statusDot"></span>
+        <span id="statusText">Checking status…</span>
+      </div>
+    </header>
+
+    <!-- Account Summary -->
+    <section class="card">
+      <h2>Account Connection</h2>
+      <div class="account-bar">
+        <div class="account-info">
+          <img id="accountAvatar" class="avatar" alt="Avatar" />
+          <div>
+            <div id="accountName" style="font-weight: 700;">Not signed in</div>
+            <div id="accountDetail" class="subtitle">Connect below to browse your Liked Music, Playlists, and Library in Amarok.</div>
+          </div>
+        </div>
+        <div class="actions" style="margin: 0;">
+          <button class="secondary" id="btnVerify" onclick="refreshStatus(true)">Verify Session</button>
+          <button class="secondary" id="btnLogout" onclick="logout()" style="display:none;">Sign Out</button>
+        </div>
+      </div>
+      <div class="banner" id="globalBanner"></div>
+    </section>
+
+    <!-- Web Authentication Methods -->
+    <section class="card">
+      <h2>Web Authentication</h2>
+      <div class="tabs">
+        <button class="tab-btn active" onclick="switchTab('browser', this)">1-Click Browser Session</button>
+        <button class="tab-btn" onclick="switchTab('headers', this)">Paste Request Headers</button>
+        <button class="tab-btn" onclick="switchTab('oauth', this)">Google OAuth (TV Client)</button>
+      </div>
+
+      <!-- Tab 1: Browser Session -->
+      <div class="tab-panel active" id="tab-browser">
+        <ol class="steps">
+          <li>Open <strong>YouTube Music</strong> in your normal desktop browser and sign in to your Google account (supports 2FA &amp; passkeys).</li>
+          <li>Select that browser below and click <strong>Connect Browser Session</strong> to sync your session cookies locally.</li>
+        </ol>
+        <div class="actions" style="margin-bottom: 14px;">
+          <a class="btn secondary" href="https://music.youtube.com" target="_blank" rel="noopener">↗ Open music.youtube.com</a>
+        </div>
+        <div class="row">
+          <div>
+            <label for="browserSelect">Browser</label>
+            <select id="browserSelect"></select>
+          </div>
+          <div>
+            <label for="keyringSelect">Linux Keyring (Chrome/Chromium)</label>
+            <select id="keyringSelect">
+              <option value="">Auto-detect (Recommended)</option>
+              <option value="KWALLET5">KWallet 5 (Plasma 5)</option>
+              <option value="KWALLET6">KWallet 6 (Plasma 6)</option>
+              <option value="GNOMEKEYRING">GNOME Keyring / libsecret</option>
+              <option value="BASICTEXT">Basic / Unencrypted</option>
+            </select>
+          </div>
+          <div>
+            <label for="profileInput">Profile (Optional)</label>
+            <input id="profileInput" placeholder="Default (leave blank)" />
+          </div>
+          <div>
+            <label for="authuserInput">Google Account Index</label>
+            <input id="authuserInput" value="0" placeholder="0" />
+          </div>
+        </div>
+        <div class="actions">
+          <button class="primary" id="btnBrowserAuth" onclick="connectBrowser()">Connect Browser Session</button>
+        </div>
+        <div class="banner" id="browserBanner"></div>
+      </div>
+
+      <!-- Tab 2: Paste Request Headers -->
+      <div class="tab-panel" id="tab-headers">
+        <ol class="steps">
+          <li>Open <a href="https://music.youtube.com" target="_blank" rel="noopener" style="color:var(--kde-blue);">music.youtube.com</a> while signed in and press <code>F12</code> → <strong>Network</strong> tab.</li>
+          <li>Filter by <code>/browse</code>, click any <code>POST</code> request to <code>music.youtube.com/youtubei/v1/browse</code>.</li>
+          <li>Copy all <strong>Request Headers</strong> (must include <code>Cookie</code> and <code>X-Goog-AuthUser</code>) and paste them below.</li>
+        </ol>
+        <label for="headersInput">Request Headers</label>
+        <textarea id="headersInput" placeholder="Accept: */*&#10;Cookie: SAPISID=...; __Secure-3PAPISID=...&#10;X-Goog-AuthUser: 0&#10;..."></textarea>
+        <div class="actions">
+          <button class="primary" id="btnHeadersAuth" onclick="connectHeaders()">Save &amp; Verify Headers</button>
+        </div>
+        <div class="banner" id="headersBanner"></div>
+      </div>
+
+      <!-- Tab 3: OAuth -->
+      <div class="tab-panel" id="tab-oauth">
+        <ol class="steps">
+          <li>In Google Cloud Console, create a <strong>TVs and Limited Input devices</strong> OAuth 2.0 Client ID with the <strong>YouTube Data API v3</strong> enabled.</li>
+          <li>Enter your Client ID &amp; Secret below, then approve the device code in your browser.</li>
+        </ol>
+        <div class="row">
+          <div>
+            <label for="oauthClientId">OAuth Client ID</label>
+            <input id="oauthClientId" placeholder="xxxx.apps.googleusercontent.com" />
+          </div>
+          <div>
+            <label for="oauthClientSecret">OAuth Client Secret</label>
+            <input id="oauthClientSecret" type="password" placeholder="GOCSPX-..." />
+          </div>
+        </div>
+        <div class="actions">
+          <button class="primary" id="btnOAuthStart" onclick="startOAuth()">Get Device Code</button>
+        </div>
+        <div class="oauth-code-box" id="oauthCodeBox">
+          <div>Visit <a id="oauthUrl" href="#" target="_blank" rel="noopener" style="color:var(--kde-blue);font-weight:700;"></a> and enter this code:</div>
+          <div class="code-big" id="oauthUserCode">----</div>
+          <div class="actions">
+            <button class="primary" id="btnOAuthComplete" onclick="completeOAuth()">I've Authorized — Finish Sign-In</button>
+          </div>
+        </div>
+        <div class="banner" id="oauthBanner"></div>
+      </div>
+    </section>
+
+    <!-- Playback & Settings -->
+    <section class="card">
+      <h2>Audio Quality &amp; Cache</h2>
+      <div class="row">
+        <div>
+          <label for="qualitySelect">Preferred Stream Quality (GStreamer)</label>
+          <select id="qualitySelect">
+            <option value="best">Best Available (Opus/WebM or M4A)</option>
+            <option value="opus">Opus / WebM (High Efficiency)</option>
+            <option value="m4a">AAC / M4A (Maximum Compatibility)</option>
+            <option value="medium">Medium (≤ 160 kbps)</option>
+          </select>
+        </div>
+        <div style="display:flex;align-items:flex-end;gap:10px;">
+          <button class="primary" onclick="saveSettings()">Save Quality</button>
+          <button class="secondary" onclick="clearCache()">Clear Cache</button>
+        </div>
+      </div>
+      <div class="banner" id="settingsBanner"></div>
+    </section>
+
+    <!-- Test Search & Stream -->
+    <section class="card">
+      <h2>Test Search &amp; Stream Proxy</h2>
+      <p class="subtitle" style="margin-bottom: 12px;">
+        Verify YouTube Music lookup and local <code>/stream/&lt;videoId&gt;</code> playback before opening Amarok.
+      </p>
+      <div class="actions" style="margin-top:0;">
+        <input id="searchInput" placeholder="Search for a song or artist…" style="flex:1;" onkeydown="if(event.key==='Enter') runTestSearch()" />
+        <button class="primary" onclick="runTestSearch()">Search</button>
+      </div>
+      <audio id="audioPreview" controls></audio>
+      <div class="track-list" id="searchResults"></div>
+    </section>
+  </div>
+
+  <script>
+    function showBanner(id, type, msg) {
+      const el = document.getElementById(id);
+      el.className = "banner show " + type;
+      el.textContent = msg;
+    }
+    function hideBanner(id) {
+      const el = document.getElementById(id);
+      el.className = "banner";
+    }
+    function switchTab(name, btn) {
+      document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
+      document.querySelectorAll(".tab-panel").forEach(p => p.classList.remove("active"));
+      btn.classList.add("active");
+      document.getElementById("tab-" + name).classList.add("active");
+    }
+
+    async function api(path, opts = {}) {
+      const res = await fetch(path, {
+        headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
+        ...opts,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data.detail || data.error || ("HTTP " + res.status));
+      }
+      return data;
+    }
+
+    async function refreshStatus(verify = false) {
+      hideBanner("globalBanner");
+      try {
+        const data = await api("/api/status" + (verify ? "?verify=true" : ""));
+        const dot = document.getElementById("statusDot");
+        const statusText = document.getElementById("statusText");
+        const accName = document.getElementById("accountName");
+        const accDetail = document.getElementById("accountDetail");
+        const avatar = document.getElementById("accountAvatar");
+        const btnLogout = document.getElementById("btnLogout");
+
+        if (data.authenticated) {
+          dot.className = "dot ok";
+          statusText.textContent = "Connected (" + data.authMode + ")";
+          accName.textContent = (data.account && data.account.accountName) || "Connected to YouTube Music";
+          const handle = data.account && data.account.channelHandle ? " • " + data.account.channelHandle : "";
+          accDetail.textContent = "Auth source: " + (data.browserSource || data.authMode) + handle + " — Ready in Amarok → Internet → YouTube Music";
+          if (data.account && data.account.accountPhotoUrl) {
+            avatar.src = data.account.accountPhotoUrl;
+            avatar.style.display = "block";
+          } else {
+            avatar.style.display = "none";
+          }
+          btnLogout.style.display = "inline-flex";
+          if (verify && data.verifyError) {
+            showBanner("globalBanner", "err", "Session warning: " + data.verifyError);
+          } else if (verify) {
+            showBanner("globalBanner", "ok", "Session verified live with YouTube Music!");
+          }
+        } else {
+          dot.className = "dot";
+          statusText.textContent = "Not Signed In";
+          accName.textContent = "Not signed in";
+          accDetail.textContent = "Connect below to browse your Liked Music, Playlists, and Library in Amarok.";
+          avatar.style.display = "none";
+          btnLogout.style.display = "none";
+        }
+
+        // Populate browser list
+        const select = document.getElementById("browserSelect");
+        const currentVal = select.value;
+        select.innerHTML = "";
+        const browsers = data.browsers && data.browsers.length
+          ? data.browsers
+          : [
+              { id: "chrome", label: "Google Chrome" },
+              { id: "chromium", label: "Chromium" },
+              { id: "firefox", label: "Firefox" },
+              { id: "brave", label: "Brave" },
+            ];
+        for (const b of browsers) {
+          const opt = document.createElement("option");
+          opt.value = b.id;
+          opt.textContent = b.label + (b.available ? " (detected)" : "");
+          select.appendChild(opt);
+        }
+        if (currentVal) select.value = currentVal;
+
+        if (data.audioQuality) {
+          document.getElementById("qualitySelect").value = data.audioQuality;
+        }
+      } catch (err) {
+        document.getElementById("statusDot").className = "dot err";
+        document.getElementById("statusText").textContent = "Daemon Error";
+        showBanner("globalBanner", "err", err.message);
+      }
+    }
+
+    async function connectBrowser() {
+      const btn = document.getElementById("btnBrowserAuth");
+      btn.disabled = true;
+      showBanner("browserBanner", "info", "Extracting cookies and verifying session with YouTube Music…");
+      try {
+        const res = await api("/api/auth/browser-extract", {
+          method: "POST",
+          body: JSON.stringify({
+            browser: document.getElementById("browserSelect").value,
+            keyring: document.getElementById("keyringSelect").value || null,
+            profile: document.getElementById("profileInput").value.trim() || null,
+            authuser: document.getElementById("authuserInput").value.trim() || "0",
+          }),
+        });
+        showBanner("browserBanner", "ok", "Connected as " + (res.accountName || "YouTube Music user") + "! Re-open YouTube Music in Amarok to see your library.");
+        await refreshStatus(false);
+      } catch (err) {
+        showBanner("browserBanner", "err", err.message);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function connectHeaders() {
+      const btn = document.getElementById("btnHeadersAuth");
+      btn.disabled = true;
+      showBanner("headersBanner", "info", "Parsing headers and verifying session…");
+      try {
+        const res = await api("/api/auth/headers", {
+          method: "POST",
+          body: JSON.stringify({ raw_headers: document.getElementById("headersInput").value }),
+        });
+        showBanner("headersBanner", "ok", "Connected as " + (res.accountName || "YouTube Music user") + "!");
+        document.getElementById("headersInput").value = "";
+        await refreshStatus(false);
+      } catch (err) {
+        showBanner("headersBanner", "err", err.message);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function startOAuth() {
+      const btn = document.getElementById("btnOAuthStart");
+      btn.disabled = true;
+      showBanner("oauthBanner", "info", "Requesting Google OAuth device code…");
+      try {
+        const res = await api("/api/auth/oauth/start", {
+          method: "POST",
+          body: JSON.stringify({
+            client_id: document.getElementById("oauthClientId").value,
+            client_secret: document.getElementById("oauthClientSecret").value,
+          }),
+        });
+        const link = document.getElementById("oauthUrl");
+        link.href = res.verification_url;
+        link.textContent = res.verification_url;
+        document.getElementById("oauthUserCode").textContent = res.user_code;
+        document.getElementById("oauthCodeBox").style.display = "block";
+        showBanner("oauthBanner", "info", "Open the Google link above, enter the code, then click Finish Sign-In.");
+      } catch (err) {
+        showBanner("oauthBanner", "err", err.message);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function completeOAuth() {
+      const btn = document.getElementById("btnOAuthComplete");
+      btn.disabled = true;
+      try {
+        const res = await api("/api/auth/oauth/complete", { method: "POST" });
+        showBanner("oauthBanner", "ok", "OAuth connected as " + (res.accountName || "YouTube Music user") + "!");
+        document.getElementById("oauthCodeBox").style.display = "none";
+        await refreshStatus(false);
+      } catch (err) {
+        showBanner("oauthBanner", "err", err.message);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function logout() {
+      await api("/api/auth/logout", { method: "POST" });
+      showBanner("globalBanner", "info", "Signed out and cleared local credentials.");
+      await refreshStatus(false);
+    }
+
+    async function saveSettings() {
+      try {
+        await api("/api/settings", {
+          method: "POST",
+          body: JSON.stringify({ audio_quality: document.getElementById("qualitySelect").value }),
+        });
+        showBanner("settingsBanner", "ok", "Audio quality preference saved and stream cache cleared.");
+      } catch (err) {
+        showBanner("settingsBanner", "err", err.message);
+      }
+    }
+
+    async function clearCache() {
+      await api("/api/cache/clear", { method: "POST" });
+      showBanner("settingsBanner", "ok", "Catalog and stream URL caches cleared.");
+    }
+
+    async function runTestSearch() {
+      const q = document.getElementById("searchInput").value.trim();
+      if (!q) return;
+      const list = document.getElementById("searchResults");
+      list.innerHTML = "<div class='subtitle'>Searching YouTube Music…</div>";
+      try {
+        const data = await api("/api/search?q=" + encodeURIComponent(q));
+        list.innerHTML = "";
+        if (!data.items || !data.items.length) {
+          list.innerHTML = "<div class='subtitle'>No tracks found.</div>";
+          return;
+        }
+        for (const t of data.items) {
+          const row = document.createElement("div");
+          row.className = "track-item";
+          row.innerHTML = `
+            <div class="track-meta">
+              <img class="track-thumb" src="${t.coverUrl || ""}" alt="" />
+              <div style="min-width:0;">
+                <div class="track-title"></div>
+                <div class="track-sub"></div>
+              </div>
+            </div>
+            <button class="secondary">▶ Test Play</button>
+          `;
+          row.querySelector(".track-title").textContent = t.itemName;
+          row.querySelector(".track-sub").textContent = `${t.artist} — ${t.album}${t.duration ? " (" + t.duration + ")" : ""}`;
+          row.querySelector("button").onclick = () => {
+            const audio = document.getElementById("audioPreview");
+            audio.style.display = "block";
+            audio.src = "/stream/" + encodeURIComponent(t.videoId);
+            audio.play().catch(() => {});
+          };
+          list.appendChild(row);
+        }
+      } catch (err) {
+        list.innerHTML = `<div class="banner show err">${err.message}</div>`;
+      }
+    }
+
+    refreshStatus(false);
+  </script>
+</body>
+</html>

@@ -1,0 +1,24 @@
+{
+    "KPlugin": {
+        "Authors": [
+            {
+                "Email": "local@localhost",
+                "Name": "amarok-ytmusic"
+            }
+        ],
+        "Category": "Scriptable Service",
+        "Dependencies": [
+            "Amarok2.0"
+        ],
+        "Description": "Stream your YouTube Music library, Liked Music, playlists, and search results in Amarok via local web auth.",
+        "EnabledByDefault": true,
+        "Icon": "internet-services",
+        "Id": "YouTube Music",
+        "License": "GPL-3.0-or-later",
+        "Name": "YouTube Music",
+        "ServiceTypes": [
+            "KPluginInfo"
+        ],
+        "Version": "0.1.0"
+    }
+}
