@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -16,7 +16,12 @@ from amarok_ytmusic.stream_resolver import ResolvedStream
 
 def test_web_ui_and_status_endpoints(tmp_path: Path) -> None:
     store = SettingsStore(config_dir=tmp_path / "cfg")
-    app = create_app(store=store, ipc_dir=tmp_path / "ipc", enable_ipc=False)
+    app = create_app(store=store, ipc_dir=tmp_path / "ipc", enable_ipc=False, enable_mpris=False)
+
+    app.state.catalog.rate_track = MagicMock(return_value={"ok": True, "videoId": "5gXrbaDHMrM", "rating": "LIKE"})
+    app.state.catalog.get_track_lyrics = MagicMock(
+        return_value={"videoId": "5gXrbaDHMrM", "found": True, "lyrics": "La la la", "source": "Musixmatch"}
+    )
 
     with TestClient(app) as client:
         r_html = client.get("/")
@@ -28,10 +33,21 @@ def test_web_ui_and_status_endpoints(tmp_path: Path) -> None:
         body = r_status.json()
         assert body["authenticated"] is False
         assert body["audioQuality"] == "best"
+        assert body["scrobbleHistory"] is True
 
-        r_set = client.post("/api/settings", json={"audio_quality": "m4a"})
+        r_set = client.post("/api/settings", json={"audio_quality": "m4a", "scrobble_history": False})
         assert r_set.status_code == 200
         assert store.load().audio_quality == "m4a"
+        assert store.load().scrobble_history is False
+
+        r_rate = client.post("/api/tracks/5gXrbaDHMrM/rate", json={"rating": "LIKE"})
+        assert r_rate.status_code == 200
+        assert r_rate.json()["rating"] == "LIKE"
+
+        r_lyrics = client.get("/api/tracks/5gXrbaDHMrM/lyrics")
+        assert r_lyrics.status_code == 200
+        assert r_lyrics.json()["found"] is True
+        assert r_lyrics.json()["lyrics"] == "La la la"
 
 
 def test_stream_proxy_supports_range_and_head(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

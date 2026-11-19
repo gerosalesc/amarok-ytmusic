@@ -18,6 +18,7 @@ from .ampache_bridge import AmpacheBridge
 from .auth import AuthError, AuthManager, detect_browsers
 from .config import SettingsStore, get_ipc_dir
 from .ipc_watcher import IPCWatcher
+from .mpris_monitor import ALLOWED_CONTROLS, MPRISMonitor
 from .stream_resolver import StreamResolutionError, StreamResolver
 from .ytmusic_client import YTMusicCatalogClient
 
@@ -44,20 +45,31 @@ class OAuthStartRequest(BaseModel):
 
 
 class SettingsUpdateRequest(BaseModel):
-    audio_quality: str
+    audio_quality: str | None = None
+    scrobble_history: bool | None = None
+
+
+class RateTrackRequest(BaseModel):
+    rating: str = "LIKE"
+
+
+class MPRISControlRequest(BaseModel):
+    command: str
 
 
 def create_app(
     store: SettingsStore | None = None,
     ipc_dir: Path | None = None,
     enable_ipc: bool = True,
+    enable_mpris: bool = True,
 ) -> FastAPI:
     settings_store = store or SettingsStore()
     auth_manager = AuthManager(settings_store)
     catalog = YTMusicCatalogClient(auth_manager)
     resolver = StreamResolver(auth_manager)
-    ampache = AmpacheBridge(catalog, auth_manager)
+    ampache = AmpacheBridge(catalog, auth_manager, state_path=settings_store.ampache_state_path)
     watcher = IPCWatcher(catalog, auth_manager, ipc_dir=ipc_dir or get_ipc_dir()) if enable_ipc else None
+    mpris = MPRISMonitor(catalog, auth_manager)
 
     http_client: httpx.AsyncClient | None = None
 
@@ -70,9 +82,13 @@ def create_app(
         )
         if watcher:
             watcher.start()
+        if enable_mpris:
+            mpris.start()
         try:
             yield
         finally:
+            if enable_mpris:
+                await mpris.stop()
             if watcher:
                 await watcher.stop()
             if http_client:
@@ -86,6 +102,7 @@ def create_app(
     app.state.resolver = resolver
     app.state.ampache = ampache
     app.state.watcher = watcher
+    app.state.mpris = mpris
 
     @app.api_route("/ampache/server/xml.server.php", methods=["GET", "POST"])
     @app.api_route("/server/xml.server.php", methods=["GET", "POST"])
@@ -93,8 +110,10 @@ def create_app(
         action: str = Query(default=""),
         filter: str = Query(default=""),
         limit: int = Query(default=0),
+        id: int = Query(default=0),
+        rating: int = Query(default=-1),
     ) -> Response:
-        xml_body = await asyncio.to_thread(ampache.handle_action, action, filter, limit)
+        xml_body = await asyncio.to_thread(ampache.handle_action, action, filter, limit, id, rating)
         return Response(content=xml_body, media_type="application/xml; charset=utf-8")
 
     @app.get("/", response_class=HTMLResponse)
@@ -124,10 +143,12 @@ def create_app(
             "authMode": settings.auth_mode,
             "browserSource": settings.browser_source,
             "audioQuality": settings.audio_quality,
+            "scrobbleHistory": settings.scrobble_history,
             "baseUrl": settings.base_url,
             "account": account,
             "verifyError": verify_error,
             "browsers": [asdict(b) for b in detect_browsers()],
+            "nowPlaying": mpris.state.to_dict(),
         }
 
     @app.post("/api/auth/browser-extract")
@@ -184,13 +205,51 @@ def create_app(
 
     @app.post("/api/settings")
     async def api_settings(req: SettingsUpdateRequest) -> dict[str, Any]:
-        if req.audio_quality not in ("best", "opus", "m4a", "medium"):
-            raise HTTPException(status_code=400, detail="Invalid audio_quality option")
         settings = settings_store.load()
-        settings.audio_quality = req.audio_quality
+        if req.audio_quality is not None:
+            if req.audio_quality not in ("best", "opus", "m4a", "medium"):
+                raise HTTPException(status_code=400, detail="Invalid audio_quality option")
+            settings.audio_quality = req.audio_quality
+            resolver.clear_cache()
+        if req.scrobble_history is not None:
+            settings.scrobble_history = req.scrobble_history
         settings_store.save(settings)
-        resolver.clear_cache()
-        return {"ok": True, "audioQuality": settings.audio_quality}
+        return {
+            "ok": True,
+            "audioQuality": settings.audio_quality,
+            "scrobbleHistory": settings.scrobble_history,
+        }
+
+    @app.get("/api/now-playing")
+    async def api_now_playing() -> dict[str, Any]:
+        state = await mpris.refresh_once()
+        return state.to_dict()
+
+    @app.post("/api/mpris/control")
+    async def api_mpris_control(req: MPRISControlRequest) -> dict[str, Any]:
+        if req.command not in ALLOWED_CONTROLS:
+            raise HTTPException(status_code=400, detail=f"Unsupported command {req.command!r}")
+        ok = await asyncio.to_thread(mpris.control_sync, req.command)
+        if not ok:
+            raise HTTPException(status_code=503, detail="Amarok is not reachable over MPRIS2 D-Bus")
+        state = await mpris.refresh_once()
+        return {"ok": True, "nowPlaying": state.to_dict()}
+
+    @app.post("/api/tracks/{video_id}/rate")
+    async def api_rate_track(video_id: str, req: RateTrackRequest) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(catalog.rate_track, video_id, req.rating)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/tracks/{video_id}/lyrics")
+    async def api_track_lyrics(video_id: str) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(catalog.get_track_lyrics, video_id)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @app.post("/api/cache/clear")
     async def api_clear_cache() -> dict[str, Any]:

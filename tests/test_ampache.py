@@ -8,9 +8,11 @@ from unittest.mock import MagicMock
 
 from fastapi.testclient import TestClient
 
-from amarok_ytmusic.ampache_bridge import parse_duration_seconds
+from amarok_ytmusic.ampache_bridge import AmpacheBridge, parse_duration_seconds
+from amarok_ytmusic.auth import AuthManager
 from amarok_ytmusic.config import SettingsStore
 from amarok_ytmusic.server import create_app
+from amarok_ytmusic.ytmusic_client import YTMusicCatalogClient
 
 
 def test_parse_duration_seconds() -> None:
@@ -121,4 +123,60 @@ def test_ampache_ping_handshake_and_browse(tmp_path: Path) -> None:
 
         r_flat_songs = client.get("/ampache/server/xml.server.php", params={"action": "songs", "limit": 1})
         assert r_flat_songs.status_code == 200
-        assert len(ET.fromstring(r_flat_songs.text).findall("song")) == 1
+        flat_song = ET.fromstring(r_flat_songs.text).find("song")
+        assert flat_song is not None
+        assert flat_song.findtext("rating") == "5"
+        song_id = int(flat_song.attrib["id"])
+
+        # 8. Rating action via Ampache XML API
+        app.state.catalog.rate_track = MagicMock(return_value={"ok": True, "videoId": "dQw4w9WgXcQ", "rating": "LIKE"})
+        r_rate = client.get(
+            "/ampache/server/xml.server.php",
+            params={"action": "rate", "id": song_id, "rating": 5},
+        )
+        assert r_rate.status_code == 200
+        app.state.catalog.rate_track.assert_called_once_with("dQw4w9WgXcQ", "LIKE")
+
+
+def test_ampache_bridge_persists_state_across_restarts(tmp_path: Path) -> None:
+    store = SettingsStore(config_dir=tmp_path / "cfg")
+    auth = AuthManager(store)
+    auth.is_authenticated = MagicMock(return_value=True)
+    catalog = YTMusicCatalogClient(auth)
+    catalog.get_root_folders = MagicMock(
+        return_value=[
+            {
+                "level": 1,
+                "itemName": "Playlist: Focus",
+                "callbackData": "playlist:PL_FOCUS",
+                "coverUrl": "",
+            }
+        ]
+    )
+    catalog.get_tracks_for_folder = MagicMock(
+        return_value=[
+            {
+                "level": 0,
+                "videoId": "vid_persist_1",
+                "itemName": "Deep Work",
+                "artist": "Synth",
+                "album": "Focus",
+                "playableUrl": "http://127.0.0.1:18732/stream/vid_persist_1",
+                "duration": "2:00",
+            }
+        ]
+    )
+
+    state_file = tmp_path / "ampache_state.json"
+    bridge1 = AmpacheBridge(catalog, auth, state_path=state_file)
+    xml_albums = bridge1.handle_action("artist_albums", filter_val="2")
+    alb_id = int(ET.fromstring(xml_albums).find("album").attrib["id"])
+    xml_songs = bridge1.handle_action("album_songs", filter_val=str(alb_id))
+    song_id = int(ET.fromstring(xml_songs).find("song").attrib["id"])
+    assert state_file.exists()
+
+    # Re-create a new AmpacheBridge from the saved state file and verify IDs are preserved
+    bridge2 = AmpacheBridge(catalog, auth, state_path=state_file)
+    assert bridge2.get_video_id_for_song_id(song_id) == "vid_persist_1"
+    xml_songs_after = bridge2.handle_action("album_songs", filter_val=str(alb_id))
+    assert int(ET.fromstring(xml_songs_after).find("song").attrib["id"]) == song_id

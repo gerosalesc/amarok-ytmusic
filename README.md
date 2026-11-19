@@ -20,6 +20,12 @@
   - Every track gets a permanent local proxy URL (`http://127.0.0.1:18732/stream/<videoId>`), so saved Amarok playlists never expire.
   - Resolves fresh YouTube audio URLs just-in-time via `yt-dlp` (with automatic fallback when no external JS runtime is installed, and automatic retry if an upstream signed URL expires with `HTTP 403/410`).
   - Full `HTTP 206 Partial Content` (`Range` / `Accept-Ranges: bytes`) support for smooth seeking in Amarok's GStreamer engine.
+- **MPRIS2 Live Sync, Scrobbling, Two-Way Ratings & Lyrics**:
+  - Monitors Amarok's `org.mpris.MediaPlayer2.Player` D-Bus interface in real time (`mpris_monitor.py`).
+  - **YouTube Music History Scrobbling**: Automatically reports tracks played in Amarok (`>= 15s`) to your YouTube Music listening history so your recommendations stay up to date.
+  - **Two-Way Like / Rating Sync**: Rating a playing track 4–5 stars in Amarok (or clicking **♥ Like** in the Web UI / CLI) likes the song on YouTube Music; Liked Music tracks also report 5 stars (`<rating>5</rating>`) to Amarok.
+  - **Persistent Ampache IDs**: Saves assigned album/song IDs in `~/.config/amarok-ytmusic/ampache_state.json` so queued tracks and collection IDs survive daemon restarts.
+  - **Live Lyrics**: View lyrics for the currently playing Amarok track from the Web UI (`http://127.0.0.1:18732`) or CLI (`amarok-ytmusic lyrics`).
 - **Future-Ready `ScriptableService` Included**:
   - Also ships `amarok_script/` (`main.js`, `script.json`, `script.spec`) and an atomic directory/file IPC watcher (`ipc_watcher.py`) ready for future Amarok 3.x releases once upstream fixes `ScriptManager::loadScript()` to call `KPluginMetaData::fromJsonFile()`.
 
@@ -133,6 +139,15 @@ flatpak run org.kde.amarok
 # Check daemon health, detected browsers, and authenticated YouTube Music account
 amarok-ytmusic status
 
+# Show the currently playing YouTube Music track in Amarok via MPRIS2
+amarok-ytmusic now
+
+# Like, dislike, or clear rating on YouTube Music for the currently playing Amarok track
+amarok-ytmusic like [VIDEO_ID] [--dislike | --clear]
+
+# Fetch and display lyrics for the currently playing Amarok track
+amarok-ytmusic lyrics [VIDEO_ID]
+
 # Sync cookies directly from a local browser via CLI
 amarok-ytmusic auth --browser chrome [--keyring KWALLET5] [--profile Default] [--authuser 0]
 
@@ -156,16 +171,17 @@ journalctl --user -u amarok-ytmusic.service -f
 amarok-ytmusic/
 ├── amarok_script/                  # Amarok ScriptableService (main.js, script.json, script.spec)
 ├── src/amarok_ytmusic/
-│   ├── ampache_bridge.py           # Ampache XML API bridge (/ampache/server/xml.server.php)
+│   ├── ampache_bridge.py           # Ampache XML API bridge with persistent ID cache
 │   ├── auth.py                     # Browser cookie extraction, raw headers parser, and OAuth
 │   ├── cli.py                      # `amarok-ytmusic` CLI entrypoint
 │   ├── config.py                   # XDG/Flatpak paths and persistent settings store
 │   ├── ipc_watcher.py              # Atomic directory/file IPC watcher for ScriptableService
+│   ├── mpris_monitor.py            # MPRIS2 D-Bus monitor, history scrobbler & rating sync
 │   ├── server.py                   # FastAPI application & Range-capable /stream/{videoId} proxy
 │   ├── stream_resolver.py          # yt-dlp stream resolver with TTL cache & multi-mode fallback
-│   ├── ytmusic_client.py           # ytmusicapi catalog client with TTL cache
-│   └── web/index.html              # Single-file dark-mode Web Auth & Control Panel UI
-├── tests/                          # Pytest unit & integration test suite (18 tests)
+│   ├── ytmusic_client.py           # ytmusicapi catalog client with rating, history & lyrics
+│   └── web/index.html              # Single-file dark-mode Web Auth & Now-Playing Control UI
+├── tests/                          # Pytest unit & integration test suite (21 tests)
 ├── install.sh                      # Automated installer (uv + Amarok config + systemd user service)
 └── pyproject.toml                  # Package metadata and dependencies
 ```

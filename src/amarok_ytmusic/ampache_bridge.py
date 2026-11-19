@@ -8,10 +8,13 @@ art, track durations, and playback via our local `/stream/<videoId>` Range proxy
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import threading
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any
 
 from .auth import AuthManager
@@ -60,9 +63,15 @@ def _xml_response(root: ET.Element) -> str:
 class AmpacheBridge:
     """Translates Amarok's Ampache XML queries into authenticated YouTube Music catalog queries."""
 
-    def __init__(self, catalog: YTMusicCatalogClient, auth_manager: AuthManager) -> None:
+    def __init__(
+        self,
+        catalog: YTMusicCatalogClient,
+        auth_manager: AuthManager,
+        state_path: Path | None = None,
+    ) -> None:
         self.catalog = catalog
         self.auth = auth_manager
+        self.state_path = state_path
         self._lock = threading.RLock()
 
         self._next_search_artist_id = 900001
@@ -75,6 +84,9 @@ class AmpacheBridge:
 
         self._next_song_id = 50000
         self._song_id_by_key: dict[tuple[int, str], int] = {}
+        self._video_id_by_song_id: dict[int, str] = {}
+
+        self._load_state()
 
         # Register core static library albums
         self._register_fixed_album(
@@ -86,6 +98,61 @@ class AmpacheBridge:
         self._register_fixed_album(
             103, ARTIST_MY_LIBRARY, "★ YouTube Music — My Library", "Quick Picks & Home", "home"
         )
+
+    def _load_state(self) -> None:
+        if not self.state_path or not self.state_path.exists():
+            return
+        try:
+            raw = json.loads(self.state_path.read_text(encoding="utf-8"))
+            self._next_album_id = max(1000, int(raw.get("next_album_id", 1000)))
+            self._next_song_id = max(50000, int(raw.get("next_song_id", 50000)))
+            for item in raw.get("albums", []):
+                entry = AlbumEntry(
+                    album_id=int(item["album_id"]),
+                    artist_id=int(item["artist_id"]),
+                    artist_name=str(item["artist_name"]),
+                    title=str(item["title"]),
+                    callback_data=str(item["callback_data"]),
+                    cover_url=str(item.get("cover_url", "")),
+                    year=int(item.get("year", 0)),
+                )
+                self._album_id_by_key[entry.callback_data] = entry.album_id
+                self._albums_by_id[entry.album_id] = entry
+            for k_str, sid_val in raw.get("songs", {}).items():
+                if ":" in k_str:
+                    alb_s, vid = k_str.split(":", 1)
+                    alb_id = int(alb_s)
+                    sid = int(sid_val)
+                    self._song_id_by_key[(alb_id, vid)] = sid
+                    self._video_id_by_song_id[sid] = vid
+        except Exception as exc:
+            log.warning("Could not load Ampache state from %s: %s", self.state_path, exc)
+
+    def _save_state(self) -> None:
+        if not self.state_path:
+            return
+        try:
+            with self._lock:
+                # Persist non-search albums (playlist/library albums) and recent songs
+                albums_payload = [
+                    asdict(e)
+                    for e in self._albums_by_id.values()
+                    if e.artist_id in (ARTIST_MY_LIBRARY, ARTIST_MY_PLAYLISTS, ARTIST_SAVED_ALBUMS)
+                ]
+                songs_items = list(self._song_id_by_key.items())[-3000:]
+                songs_payload = {f"{alb_id}:{vid}": sid for (alb_id, vid), sid in songs_items}
+                payload = {
+                    "next_album_id": self._next_album_id,
+                    "next_song_id": self._next_song_id,
+                    "albums": albums_payload,
+                    "songs": songs_payload,
+                }
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.state_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload), encoding="utf-8")
+            os.replace(tmp, self.state_path)
+        except Exception as exc:
+            log.warning("Could not save Ampache state to %s: %s", self.state_path, exc)
 
     def _register_fixed_album(
         self,
@@ -157,9 +224,21 @@ class AmpacheBridge:
                 self._next_song_id += 1
                 sid = self._next_song_id
                 self._song_id_by_key[key] = sid
+            self._video_id_by_song_id[sid] = video_id
             return sid
 
-    def handle_action(self, action: str, filter_val: str = "", limit: int = 0) -> str:
+    def get_video_id_for_song_id(self, song_id: int) -> str | None:
+        with self._lock:
+            return self._video_id_by_song_id.get(song_id)
+
+    def handle_action(
+        self,
+        action: str,
+        filter_val: str = "",
+        limit: int = 0,
+        item_id: int = 0,
+        rating: int = -1,
+    ) -> str:
         action = (action or "").strip().lower()
         filter_val = (filter_val or "").strip()
 
@@ -171,21 +250,43 @@ class AmpacheBridge:
             if action == "artists":
                 return self._handle_artists(filter_val)
             if action == "artist_albums":
-                return self._handle_artist_albums(filter_val, limit=limit)
+                res = self._handle_artist_albums(filter_val, limit=limit)
+                self._save_state()
+                return res
             if action == "albums":
-                return self._handle_albums(filter_val, limit=limit)
+                res = self._handle_albums(filter_val, limit=limit)
+                self._save_state()
+                return res
             if action == "album_songs":
-                return self._handle_album_songs(filter_val, limit=limit)
+                res = self._handle_album_songs(filter_val, limit=limit)
+                self._save_state()
+                return res
             if action == "artist_songs":
-                return self._handle_artist_songs(filter_val, limit=limit)
+                res = self._handle_artist_songs(filter_val, limit=limit)
+                self._save_state()
+                return res
             if action == "songs":
-                return self._handle_songs(filter_val, limit=limit)
+                res = self._handle_songs(filter_val, limit=limit)
+                self._save_state()
+                return res
+            if action == "rate":
+                return self._handle_rate(item_id=item_id or (int(filter_val) if filter_val.isdigit() else 0), rating=rating)
         except Exception as exc:
             log.exception("Ampache action=%s (filter=%r) failed: %s", action, filter_val, exc)
             return _xml_response(ET.Element("root"))
 
         # Fallback empty valid XML root for any optional Ampache action
         return _xml_response(ET.Element("root"))
+
+    def _handle_rate(self, item_id: int, rating: int) -> str:
+        root = ET.Element("root")
+        vid = self.get_video_id_for_song_id(item_id)
+        if not vid:
+            return _xml_response(root)
+        yt_rating = "LIKE" if rating >= 4 else ("DISLIKE" if rating == 1 else "INDIFFERENT")
+        self.catalog.rate_track(vid, yt_rating)
+        ET.SubElement(root, "result").text = "ok"
+        return _xml_response(root)
 
     def _handle_ping(self) -> str:
         root = ET.Element("root")
@@ -240,6 +341,8 @@ class AmpacheBridge:
         alb_el.text = album_entry.title
         ET.SubElement(el, "track").text = str(track_num)
         ET.SubElement(el, "time").text = str(parse_duration_seconds(str(track.get("duration") or "")))
+        if album_entry.callback_data == "liked":
+            ET.SubElement(el, "rating").text = "5"
         ET.SubElement(el, "url").text = str(track.get("playableUrl") or "")
         ET.SubElement(el, "art").text = str(track.get("coverUrl") or album_entry.cover_url or "")
 

@@ -14,7 +14,9 @@ import uvicorn
 
 from .auth import AuthError, AuthManager, detect_browsers
 from .config import DEFAULT_HOST, DEFAULT_PORT, SettingsStore
+from .mpris_monitor import MPRISMonitor
 from .server import create_app
+from .ytmusic_client import YTMusicCatalogClient
 
 
 def _open_browser_later(url: str, delay: float = 1.0) -> None:
@@ -117,6 +119,73 @@ def cmd_status(_args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_now(_args: argparse.Namespace) -> int:
+    store = SettingsStore()
+    auth = AuthManager(store)
+    catalog = YTMusicCatalogClient(auth)
+    monitor = MPRISMonitor(catalog, auth)
+    snap = monitor.read_mpris_snapshot_sync()
+    if not snap.amarok_running:
+        print("Amarok is not currently running.")
+        return 1
+    print(f"Status   : {snap.playback_status}")
+    print(f"Title    : {snap.title or '(none)'}")
+    print(f"Album    : {snap.album or '(none)'}")
+    if snap.is_ytmusic:
+        print(f"Video ID : {snap.video_id}")
+        print(f"Progress : {snap.position_sec:.1f}s / {snap.duration_sec:.1f}s")
+        print(f"Rating   : {snap.user_rating:.2f}")
+    return 0
+
+
+def cmd_like(args: argparse.Namespace) -> int:
+    store = SettingsStore()
+    auth = AuthManager(store)
+    catalog = YTMusicCatalogClient(auth)
+
+    video_id = args.video_id
+    if not video_id:
+        monitor = MPRISMonitor(catalog, auth)
+        snap = monitor.read_mpris_snapshot_sync()
+        if not snap.is_ytmusic or not snap.video_id:
+            print("No active YouTube Music track playing in Amarok. Pass a video_id explicitly.", file=sys.stderr)
+            return 1
+        video_id = snap.video_id
+
+    rating = "DISLIKE" if args.dislike else ("INDIFFERENT" if args.clear else "LIKE")
+    res = catalog.rate_track(video_id, rating)
+    print(f"Rated YouTube Music track {res['videoId']} -> {res['rating']}")
+    return 0
+
+
+def cmd_lyrics(args: argparse.Namespace) -> int:
+    store = SettingsStore()
+    auth = AuthManager(store)
+    catalog = YTMusicCatalogClient(auth)
+
+    video_id = args.video_id
+    title_hint = ""
+    if not video_id:
+        monitor = MPRISMonitor(catalog, auth)
+        snap = monitor.read_mpris_snapshot_sync()
+        if not snap.is_ytmusic or not snap.video_id:
+            print("No active YouTube Music track playing in Amarok. Pass a video_id explicitly.", file=sys.stderr)
+            return 1
+        video_id = snap.video_id
+        title_hint = snap.title
+
+    data = catalog.get_track_lyrics(video_id)
+    if title_hint:
+        print(f"=== {title_hint} ({video_id}) ===\n")
+    if not data.get("found"):
+        print("No lyrics available on YouTube Music for this track.")
+        return 1
+    print(data["lyrics"])
+    if data.get("source"):
+        print(f"\n— {data['source']}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="amarok-ytmusic",
@@ -140,6 +209,19 @@ def main(argv: list[str] | None = None) -> int:
 
     p_status = sub.add_parser("status", help="Show daemon and YouTube Music authentication status")
     p_status.set_defaults(func=cmd_status)
+
+    p_now = sub.add_parser("now", help="Show the currently playing YouTube Music track in Amarok via MPRIS2")
+    p_now.set_defaults(func=cmd_now)
+
+    p_like = sub.add_parser("like", help="Like, dislike, or clear rating for the current Amarok track on YouTube Music")
+    p_like.add_argument("video_id", nargs="?", help="Optional video ID (defaults to currently playing Amarok track)")
+    p_like.add_argument("--dislike", action="store_true", help="Dislike the track instead of liking")
+    p_like.add_argument("--clear", action="store_true", help="Reset rating to indifferent")
+    p_like.set_defaults(func=cmd_like)
+
+    p_lyrics = sub.add_parser("lyrics", help="Fetch lyrics for the current Amarok track from YouTube Music")
+    p_lyrics.add_argument("video_id", nargs="?", help="Optional video ID (defaults to currently playing Amarok track)")
+    p_lyrics.set_defaults(func=cmd_lyrics)
 
     args = parser.parse_args(argv)
     return int(args.func(args))

@@ -56,6 +56,7 @@ class AppSettings:
     authuser: str = "0"
     oauth_client_id: str = ""
     oauth_client_secret: str = ""
+    scrobble_history: bool = True
 
     @property
     def base_url(self) -> str:
@@ -83,6 +84,7 @@ class SettingsStore:
         self.browser_auth_path = self.config_dir / "browser.json"
         self.oauth_auth_path = self.config_dir / "oauth.json"
         self.cookies_txt_path = self.config_dir / "cookies.txt"
+        self.ampache_state_path = self.config_dir / "ampache_state.json"
 
     def load(self) -> AppSettings:
         if not self.settings_path.exists():

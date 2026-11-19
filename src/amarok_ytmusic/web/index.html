@@ -284,7 +284,7 @@
       </div>
     </header>
 
-    <!-- Account Summary -->
+      <!-- Account Summary -->
     <section class="card">
       <h2>Account Connection</h2>
       <div class="account-bar">
@@ -301,6 +301,30 @@
         </div>
       </div>
       <div class="banner" id="globalBanner"></div>
+    </section>
+
+    <!-- Live Amarok Now Playing (MPRIS2) -->
+    <section class="card" id="nowPlayingCard">
+      <h2>
+        <span>Now Playing in Amarok (MPRIS2)</span>
+        <span class="pill" id="npBadge" style="font-size:0.78rem;padding:4px 10px;">Idle</span>
+      </h2>
+      <div class="account-bar">
+        <div>
+          <div id="npTitle" style="font-weight:700;font-size:1.02rem;">No YouTube Music track active</div>
+          <div id="npMeta" class="subtitle">Play any track from Internet → Ampache (YouTube Music) in Amarok.</div>
+        </div>
+        <div class="actions" style="margin:0;">
+          <button class="secondary" onclick="mprisCmd('Previous')" title="Previous Track">⏮</button>
+          <button class="primary" onclick="mprisCmd('PlayPause')" title="Play / Pause">⏯</button>
+          <button class="secondary" onclick="mprisCmd('Next')" title="Next Track">⏭</button>
+          <button class="secondary" id="btnNpLike" onclick="rateCurrentTrack('LIKE')" title="Like on YouTube Music">♥ Like</button>
+          <button class="secondary" id="btnNpDislike" onclick="rateCurrentTrack('DISLIKE')" title="Dislike on YouTube Music">👎</button>
+          <button class="secondary" id="btnNpLyrics" onclick="showCurrentLyrics()" title="Fetch Lyrics">📜 Lyrics</button>
+        </div>
+      </div>
+      <pre id="lyricsBox" style="display:none;margin-top:12px;padding:14px;border-radius:10px;background:var(--bg);border:1px solid var(--border);max-height:260px;overflow:auto;white-space:pre-wrap;font-family:inherit;font-size:0.88rem;line-height:1.55;"></pre>
+      <div class="banner" id="npBanner"></div>
     </section>
 
     <!-- Web Authentication Methods -->
@@ -398,7 +422,7 @@
 
     <!-- Playback & Settings -->
     <section class="card">
-      <h2>Audio Quality &amp; Cache</h2>
+      <h2>Audio Quality, Scrobbling &amp; Cache</h2>
       <div class="row">
         <div>
           <label for="qualitySelect">Preferred Stream Quality (GStreamer)</label>
@@ -409,8 +433,15 @@
             <option value="medium">Medium (≤ 160 kbps)</option>
           </select>
         </div>
+        <div>
+          <label for="scrobbleSelect">YouTube Music History Scrobbling</label>
+          <select id="scrobbleSelect">
+            <option value="true">Enabled (report tracks played in Amarok)</option>
+            <option value="false">Disabled</option>
+          </select>
+        </div>
         <div style="display:flex;align-items:flex-end;gap:10px;">
-          <button class="primary" onclick="saveSettings()">Save Quality</button>
+          <button class="primary" onclick="saveSettings()">Save Settings</button>
           <button class="secondary" onclick="clearCache()">Clear Cache</button>
         </div>
       </div>
@@ -522,10 +553,111 @@
         if (data.audioQuality) {
           document.getElementById("qualitySelect").value = data.audioQuality;
         }
+        if (typeof data.scrobbleHistory === "boolean") {
+          document.getElementById("scrobbleSelect").value = String(data.scrobbleHistory);
+        }
+        if (data.nowPlaying) {
+          renderNowPlaying(data.nowPlaying);
+        }
       } catch (err) {
         document.getElementById("statusDot").className = "dot err";
         document.getElementById("statusText").textContent = "Daemon Error";
         showBanner("globalBanner", "err", err.message);
+      }
+    }
+
+    let currentNpVideoId = "";
+
+    function fmtTime(sec) {
+      sec = Math.max(0, Math.floor(sec || 0));
+      const m = Math.floor(sec / 60);
+      const s = sec % 60;
+      return m + ":" + (s < 10 ? "0" + s : s);
+    }
+
+    function renderNowPlaying(np) {
+      const badge = document.getElementById("npBadge");
+      const title = document.getElementById("npTitle");
+      const meta = document.getElementById("npMeta");
+
+      if (!np || !np.amarok_running) {
+        badge.textContent = "Amarok Offline";
+        title.textContent = "Amarok is not running";
+        meta.textContent = "Launch Amarok (flatpak run org.kde.amarok) to control and sync playback.";
+        currentNpVideoId = "";
+        return;
+      }
+
+      if (!np.is_ytmusic) {
+        badge.textContent = np.playback_status || "Idle";
+        title.textContent = np.title || "No YouTube Music track active";
+        meta.textContent = "Play a track from Internet → Ampache (YouTube Music) in Amarok.";
+        currentNpVideoId = "";
+        return;
+      }
+
+      currentNpVideoId = np.video_id;
+      const scrobbleTag = np.scrobbled ? " • Scrobbled ✓" : "";
+      const ratingTag = np.last_synced_rating ? ` • Rated ${np.last_synced_rating}` : "";
+      badge.textContent = `${np.playback_status} (${fmtTime(np.position_sec)} / ${fmtTime(np.duration_sec)})`;
+      title.textContent = np.title || np.video_id;
+      meta.textContent = `${np.album || "YouTube Music"} • ID: ${np.video_id}${scrobbleTag}${ratingTag}`;
+    }
+
+    async function pollNowPlaying() {
+      try {
+        const np = await api("/api/now-playing");
+        renderNowPlaying(np);
+      } catch (_) {}
+    }
+
+    async function mprisCmd(command) {
+      hideBanner("npBanner");
+      try {
+        const res = await api("/api/mpris/control", {
+          method: "POST",
+          body: JSON.stringify({ command }),
+        });
+        if (res.nowPlaying) renderNowPlaying(res.nowPlaying);
+      } catch (err) {
+        showBanner("npBanner", "err", err.message);
+      }
+    }
+
+    async function rateCurrentTrack(rating) {
+      if (!currentNpVideoId) {
+        showBanner("npBanner", "info", "Play a YouTube Music track in Amarok first.");
+        return;
+      }
+      try {
+        await api("/api/tracks/" + encodeURIComponent(currentNpVideoId) + "/rate", {
+          method: "POST",
+          body: JSON.stringify({ rating }),
+        });
+        showBanner("npBanner", "ok", `Synced ${rating} to YouTube Music for ${currentNpVideoId}!`);
+        await pollNowPlaying();
+      } catch (err) {
+        showBanner("npBanner", "err", err.message);
+      }
+    }
+
+    async function showCurrentLyrics() {
+      const box = document.getElementById("lyricsBox");
+      if (!currentNpVideoId) {
+        showBanner("npBanner", "info", "Play a YouTube Music track in Amarok first.");
+        return;
+      }
+      box.style.display = "block";
+      box.textContent = "Fetching lyrics from YouTube Music…";
+      try {
+        const data = await api("/api/tracks/" + encodeURIComponent(currentNpVideoId) + "/lyrics");
+        if (!data.found) {
+          box.textContent = "No lyrics available for this track on YouTube Music.";
+        } else {
+          box.textContent = data.lyrics + (data.source ? "\n\n— " + data.source : "");
+        }
+      } catch (err) {
+        box.textContent = "Failed to load lyrics: " + err.message;
       }
     }
 
@@ -621,9 +753,12 @@
       try {
         await api("/api/settings", {
           method: "POST",
-          body: JSON.stringify({ audio_quality: document.getElementById("qualitySelect").value }),
+          body: JSON.stringify({
+            audio_quality: document.getElementById("qualitySelect").value,
+            scrobble_history: document.getElementById("scrobbleSelect").value === "true",
+          }),
         });
-        showBanner("settingsBanner", "ok", "Audio quality preference saved and stream cache cleared.");
+        showBanner("settingsBanner", "ok", "Settings saved and stream cache cleared.");
       } catch (err) {
         showBanner("settingsBanner", "err", err.message);
       }
@@ -675,6 +810,7 @@
     }
 
     refreshStatus(false);
+    setInterval(pollNowPlaying, 3500);
   </script>
 </body>
 </html>

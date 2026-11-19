@@ -448,3 +448,69 @@ class YTMusicCatalogClient:
             if t is not None:
                 results.append(t.to_dict())
         return results
+
+    def rate_track(self, video_id: str, rating: str = "LIKE") -> dict[str, Any]:
+        """Rate a YouTube Music song ('LIKE', 'DISLIKE', or 'INDIFFERENT')."""
+        from ytmusicapi.models.content.enums import LikeStatus
+
+        if not self.auth.is_authenticated():
+            raise RuntimeError("Sign in to YouTube Music before rating tracks.")
+
+        norm = rating.strip().upper()
+        status_map = {
+            "LIKE": LikeStatus.LIKE,
+            "DISLIKE": LikeStatus.DISLIKE,
+            "INDIFFERENT": LikeStatus.INDIFFERENT,
+            "NONE": LikeStatus.INDIFFERENT,
+        }
+        if norm not in status_map:
+            raise ValueError(f"Unsupported rating {rating!r}; use LIKE, DISLIKE, or INDIFFERENT.")
+
+        yt = self.auth.create_ytmusic()
+        yt.rate_song(video_id, status_map[norm])
+        # Invalidate cached Liked Music & Library Songs so changes show up immediately
+        self._cache.pop("tracks:liked", None)
+        self._cache.pop("tracks:library_songs", None)
+        log.info("Rated YouTube Music track %s -> %s", video_id, norm)
+        return {"ok": True, "videoId": video_id, "rating": norm}
+
+    def report_playback_history(self, video_id: str) -> bool:
+        """Report a played track to YouTube Music listening history."""
+        if not self.auth.is_authenticated():
+            return False
+        yt = self.auth.create_ytmusic()
+        try:
+            song = yt.get_song(video_id)
+            resp = yt.add_history_item(song)
+            ok = getattr(resp, "status_code", 204) in (200, 204)
+            log.info("Reported playback history for %s (ok=%s)", video_id, ok)
+            return ok
+        except Exception as exc:
+            log.warning("Could not report playback history for %s: %s", video_id, exc)
+            return False
+
+    def get_track_lyrics(self, video_id: str) -> dict[str, Any]:
+        """Fetch plain or timed lyrics for a YouTube Music track."""
+        yt = self.auth.create_ytmusic()
+        watch = yt.get_watch_playlist(videoId=video_id, limit=1) or {}
+        lyrics_browse_id = watch.get("lyrics")
+        if not lyrics_browse_id:
+            return {"videoId": video_id, "found": False, "lyrics": "", "source": ""}
+
+        lyrics_obj = yt.get_lyrics(str(lyrics_browse_id))
+        if not lyrics_obj:
+            return {"videoId": video_id, "found": False, "lyrics": "", "source": ""}
+
+        if isinstance(lyrics_obj, dict):
+            text = str(lyrics_obj.get("lyrics") or "")
+            source = str(lyrics_obj.get("source") or "")
+        else:
+            text = str(getattr(lyrics_obj, "lyrics", "") or "")
+            source = str(getattr(lyrics_obj, "source", "") or "")
+
+        return {
+            "videoId": video_id,
+            "found": bool(text.strip()),
+            "lyrics": text,
+            "source": source,
+        }
