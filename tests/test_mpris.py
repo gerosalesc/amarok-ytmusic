@@ -11,6 +11,7 @@ from amarok_ytmusic.config import SettingsStore
 from amarok_ytmusic.mpris_monitor import (
     MPRISMonitor,
     NowPlayingState,
+    extract_video_id_from_comment,
     extract_video_id_from_url,
     rating_float_to_like_status,
 )
@@ -21,6 +22,9 @@ def test_extract_video_id_and_rating_mapping() -> None:
     assert extract_video_id_from_url("http://127.0.0.1:18732/stream/5gXrbaDHMrM") == "5gXrbaDHMrM"
     assert extract_video_id_from_url("file:///home/user/Music/song.mp3") == ""
     assert extract_video_id_from_url("") == ""
+
+    assert extract_video_id_from_comment(["ytmusic:5gXrbaDHMrM"]) == "5gXrbaDHMrM"
+    assert extract_video_id_from_comment(["regular comment"]) == ""
 
     assert rating_float_to_like_status(0.0) is None
     assert rating_float_to_like_status(1.0) == "LIKE"

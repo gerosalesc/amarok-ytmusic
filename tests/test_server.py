@@ -52,7 +52,10 @@ def test_web_ui_and_status_endpoints(tmp_path: Path) -> None:
 
 def test_stream_proxy_supports_range_and_head(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     store = SettingsStore(config_dir=tmp_path / "cfg")
-    app = create_app(store=store, ipc_dir=tmp_path / "ipc", enable_ipc=False)
+    settings = store.load()
+    settings.auto_import_metadata = False
+    store.save(settings)
+    app = create_app(store=store, ipc_dir=tmp_path / "ipc", enable_ipc=False, enable_mpris=False)
 
     fake_audio = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
@@ -121,7 +124,10 @@ def test_stream_proxy_supports_range_and_head(tmp_path: Path, monkeypatch: pytes
 
 def test_stream_proxy_retries_on_upstream_403(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     store = SettingsStore(config_dir=tmp_path / "cfg")
-    app = create_app(store=store, ipc_dir=tmp_path / "ipc", enable_ipc=False)
+    settings = store.load()
+    settings.auto_import_metadata = False
+    store.save(settings)
+    app = create_app(store=store, ipc_dir=tmp_path / "ipc", enable_ipc=False, enable_mpris=False)
 
     resolve_calls: list[bool] = []
 

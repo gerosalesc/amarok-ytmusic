@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from .auth import AuthManager
+from .metadata_store import MetadataStore
 from .ytmusic_client import YTMusicCatalogClient
 
 log = logging.getLogger("amarok_ytmusic.ampache")
@@ -25,6 +26,7 @@ log = logging.getLogger("amarok_ytmusic.ampache")
 ARTIST_MY_LIBRARY = 1
 ARTIST_MY_PLAYLISTS = 2
 ARTIST_SAVED_ALBUMS = 3
+ARTIST_IMPORTED_BASE = 40000
 
 
 @dataclass
@@ -68,15 +70,21 @@ class AmpacheBridge:
         catalog: YTMusicCatalogClient,
         auth_manager: AuthManager,
         state_path: Path | None = None,
+        metadata_store: MetadataStore | None = None,
     ) -> None:
         self.catalog = catalog
         self.auth = auth_manager
         self.state_path = state_path
+        self.metadata_store = metadata_store
         self._lock = threading.RLock()
 
         self._next_search_artist_id = 900001
         self._search_artist_by_query: dict[str, int] = {}
         self._search_query_by_artist: dict[int, str] = {}
+
+        self._next_cached_artist_id = ARTIST_IMPORTED_BASE
+        self._cached_artist_id_by_name: dict[str, int] = {}
+        self._cached_artist_name_by_id: dict[int, str] = {}
 
         self._next_album_id = 1000
         self._album_id_by_key: dict[str, int] = {}
@@ -215,6 +223,17 @@ class AmpacheBridge:
                 self._search_artist_by_query[key] = aid
                 self._search_query_by_artist[aid] = norm
             return aid, f"Search: {norm}"
+
+    def _get_or_create_cached_artist(self, artist_name: str) -> int:
+        key = artist_name.strip().lower()
+        with self._lock:
+            aid = self._cached_artist_id_by_name.get(key)
+            if aid is None:
+                aid = self._next_cached_artist_id
+                self._next_cached_artist_id += 1
+                self._cached_artist_id_by_name[key] = aid
+                self._cached_artist_name_by_id[aid] = artist_name.strip()
+            return aid
 
     def _get_song_id(self, album_id: int, video_id: str) -> int:
         key = (album_id, video_id)
@@ -365,17 +384,40 @@ class AmpacheBridge:
         self._append_artist(root, ARTIST_MY_LIBRARY, "★ YouTube Music — My Library")
         self._append_artist(root, ARTIST_MY_PLAYLISTS, "♫ YouTube Music — My Playlists")
         self._append_artist(root, ARTIST_SAVED_ALBUMS, "◎ YouTube Music — Saved Albums")
+
+        # Also surface real artists from the cached/imported metadata store (with real albums & cover art!)
+        if self.metadata_store:
+            for artist_name in self.metadata_store.list_cached_artists():
+                aid = self._get_or_create_cached_artist(artist_name)
+                self._append_artist(root, aid, artist_name)
+
         return _xml_response(root)
 
     def _albums_for_artist(self, artist_id: int) -> list[AlbumEntry]:
         if artist_id == ARTIST_MY_LIBRARY:
             if not self.auth.is_authenticated():
                 return []
-            return [
+            # Attach cover art from the most recently cached track if static albums have no cover yet
+            fallback_cover = ""
+            if self.metadata_store:
+                recent = self.metadata_store.list_tracks(limit=1)
+                if recent and (recent[0].cover_local_path or recent[0].cover_url):
+                    settings = self.auth.get_settings()
+                    fallback_cover = (
+                        f"{settings.base_url}/cover/{recent[0].video_id}"
+                        if recent[0].cover_local_path
+                        else recent[0].cover_url
+                    )
+            entries = [
                 self._albums_by_id[101],
                 self._albums_by_id[102],
                 self._albums_by_id[103],
             ]
+            if fallback_cover:
+                for e in entries:
+                    if not e.cover_url:
+                        e.cover_url = fallback_cover
+            return entries
 
         if artist_id == ARTIST_MY_PLAYLISTS:
             folders = self.catalog.get_root_folders("")
@@ -411,6 +453,32 @@ class AmpacheBridge:
                             cover_url=str(f.get("coverUrl") or ""),
                         )
                     )
+            return entries
+
+        # Real imported artist from SQLite metadata cache
+        with self._lock:
+            cached_artist_name = self._cached_artist_name_by_id.get(artist_id)
+        if cached_artist_name and self.metadata_store:
+            settings = self.auth.get_settings()
+            tracks = self.metadata_store.list_tracks_by_artist(cached_artist_name)
+            by_album: dict[str, tuple[str, int]] = {}
+            for t in tracks:
+                alb = t.album or "Singles"
+                if alb not in by_album:
+                    cov = f"{settings.base_url}/cover/{t.video_id}" if t.cover_local_path else t.cover_url
+                    by_album[alb] = (cov, t.year)
+            entries = []
+            for alb_name, (cov, yr) in by_album.items():
+                entries.append(
+                    self._register_dynamic_album(
+                        artist_id,
+                        cached_artist_name,
+                        alb_name,
+                        f"cached_album:{cached_artist_name}::{alb_name}",
+                        cover_url=cov,
+                        year=yr,
+                    )
+                )
             return entries
 
         # Dynamic search artist
@@ -475,6 +543,27 @@ class AmpacheBridge:
         with self._lock:
             entry = self._albums_by_id.get(album_id)
         if not entry:
+            return _xml_response(root)
+
+        if entry.callback_data.startswith("cached_album:") and self.metadata_store:
+            rest = entry.callback_data.split(":", 1)[1]
+            artist_name, alb_name = rest.split("::", 1) if "::" in rest else (rest, "")
+            settings = self.auth.get_settings()
+            cached_tracks = [
+                t for t in self.metadata_store.list_tracks_by_artist(artist_name) if (t.album or "Singles") == alb_name
+            ]
+            if limit > 0:
+                cached_tracks = cached_tracks[:limit]
+            for idx, ct in enumerate(cached_tracks, start=1):
+                track_dict = {
+                    "videoId": ct.video_id,
+                    "itemName": ct.title,
+                    "artist": "",  # Parent Ampache artist is already the real artist name
+                    "playableUrl": settings.stream_url(ct.video_id),
+                    "duration": f"{ct.duration_sec // 60}:{ct.duration_sec % 60:02d}" if ct.duration_sec else "",
+                    "coverUrl": f"{settings.base_url}/cover/{ct.video_id}" if ct.cover_local_path else ct.cover_url,
+                }
+                self._append_song(root, entry, track_dict, idx)
             return _xml_response(root)
 
         tracks = self.catalog.get_tracks_for_folder(entry.callback_data)

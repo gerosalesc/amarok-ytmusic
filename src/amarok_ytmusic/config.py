@@ -57,10 +57,19 @@ class AppSettings:
     oauth_client_id: str = ""
     oauth_client_secret: str = ""
     scrobble_history: bool = True
+    auto_import_metadata: bool = True
+    auto_import_collection: bool = True
+    collection_dir: str = ""  # Defaults to ~/Music/YouTube Music when empty
+    max_collection_cache_mb: int = 2048  # 0 = unlimited
 
     @property
     def base_url(self) -> str:
         return f"http://{self.host}:{self.port}"
+
+    def resolved_collection_dir(self) -> Path:
+        if self.collection_dir and self.collection_dir.strip():
+            return Path(self.collection_dir).expanduser()
+        return Path.home() / "Music" / "YouTube Music"
 
     def stream_url(self, video_id: str) -> str:
         return f"{self.base_url}/stream/{video_id}"
@@ -85,6 +94,9 @@ class SettingsStore:
         self.oauth_auth_path = self.config_dir / "oauth.json"
         self.cookies_txt_path = self.config_dir / "cookies.txt"
         self.ampache_state_path = self.config_dir / "ampache_state.json"
+        self.metadata_db_path = self.config_dir / "metadata_cache.db"
+        self.covers_cache_dir = self.config_dir / "covers"
+        self.covers_cache_dir.mkdir(parents=True, exist_ok=True)
 
     def load(self) -> AppSettings:
         if not self.settings_path.exists():

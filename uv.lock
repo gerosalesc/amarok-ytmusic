@@ -10,6 +10,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "httpx" },
     { name = "jeepney" },
+    { name = "mutagen" },
     { name = "uvicorn", extra = ["standard"] },
     { name = "yt-dlp" },
     { name = "ytmusicapi" },
@@ -26,6 +27,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "jeepney", specifier = ">=0.9.0" },
+    { name = "mutagen", specifier = ">=1.48.1" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32.0" },
@@ -418,6 +420,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/7b/6f/357efd7602486741aa73ffc0617fb310a29b588ed0fd69c2399acbb85b0c/jeepney-0.9.0.tar.gz", hash = "sha256:cf0e9e845622b81e4a28df94c40345400256ec608d0e55bb8a3feaa9163f5732", size = 106758, upload-time = "2025-02-27T18:51:01.684Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b2/a3/e137168c9c44d18eff0376253da9f1e9234d0239e0ee230d2fee6cea8e55/jeepney-0.9.0-py3-none-any.whl", hash = "sha256:97e5714520c16fc0a45695e5365a2e11b81ea79bba796e26f9f1d178cb182683", size = 49010, upload-time = "2025-02-27T18:51:00.104Z" },
+]
+
+[[package]]
+name = "mutagen"
+version = "1.48.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/df/70/1675da133ea92227da41bf5b24e1c66be597ff736a1533ade41da986852f/mutagen-1.48.1.tar.gz", hash = "sha256:8f95637ab9f6f305cec6bd1294e197debe207998e3e068596563c74f86b0a173", size = 1276978, upload-time = "2026-06-25T09:47:32.443Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/47/d8/a29e4e3991765e7ce4ed1f7e4074fe1ba9da03e0048639734de60f9cadb9/mutagen-1.48.1-py3-none-any.whl", hash = "sha256:4f077fe87d3fc7fba259aa63d8c026b18382ca6a42ef37c61e16f1b1b5b82fe7", size = 195706, upload-time = "2026-06-25T09:47:30.296Z" },
 ]
 
 [[package]]

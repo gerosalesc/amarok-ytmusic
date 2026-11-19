@@ -14,8 +14,10 @@ import uvicorn
 
 from .auth import AuthError, AuthManager, detect_browsers
 from .config import DEFAULT_HOST, DEFAULT_PORT, SettingsStore
+from .metadata_store import MetadataStore
 from .mpris_monitor import MPRISMonitor
 from .server import create_app
+from .track_importer import TrackImporter
 from .ytmusic_client import YTMusicCatalogClient
 
 
@@ -186,6 +188,54 @@ def cmd_lyrics(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_import(args: argparse.Namespace) -> int:
+    store = SettingsStore()
+    auth = AuthManager(store)
+    meta_store = MetadataStore(store.metadata_db_path)
+    importer = TrackImporter(auth, meta_store)
+    catalog = YTMusicCatalogClient(auth)
+
+    video_id = args.video_id
+    if not video_id:
+        monitor = MPRISMonitor(catalog, auth, metadata_store=meta_store, importer=importer)
+        snap = monitor.read_mpris_snapshot_sync()
+        if not snap.is_ytmusic or not snap.video_id:
+            print("No active YouTube Music track playing in Amarok. Pass a video_id explicitly.", file=sys.stderr)
+            return 1
+        video_id = snap.video_id
+
+    if args.metadata_only:
+        track = importer.fetch_and_cache_metadata_sync(video_id, force_refresh=args.refresh)
+    else:
+        track = importer.import_to_local_collection_sync(video_id, force_refresh=args.refresh)
+
+    print(f"Title    : {track.title}")
+    print(f"Artist   : {track.artist}")
+    print(f"Album    : {track.album} ({track.year or 'N/A'})")
+    print(f"Liked    : {track.like_status or 'NONE'} (inLibrary={track.in_library})")
+    print(f"Stats    : plays={track.play_count}, score={track.score}")
+    print(f"Cover    : {track.cover_local_path or track.cover_url or '(none)'}")
+    print(f"Lyrics   : {'yes (' + str(len(track.lyrics)) + ' chars)' if track.lyrics else 'no'}")
+    print(f"Local    : {track.local_file_path or '(metadata only)'}")
+    return 0
+
+
+def cmd_cache(args: argparse.Namespace) -> int:
+    store = SettingsStore()
+    meta_store = MetadataStore(store.metadata_db_path)
+    stats = meta_store.stats_summary()
+    print(
+        f"Cached tracks: {stats['totalTracks']} | In Local Collection: {stats['localFiles']} | "
+        f"Liked: {stats['likedCached']} | Total plays: {stats['totalPlays']}"
+    )
+    tracks = meta_store.list_tracks(limit=args.limit)
+    for t in tracks:
+        like_s = "♥" if t.like_status == "LIKE" else " "
+        local_s = "[local]" if t.local_file_path else "[meta] "
+        print(f"  {like_s} {local_s} {t.video_id}  {t.title} — {t.artist} [{t.album}] (plays={t.play_count}, score={int(t.score)})")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="amarok-ytmusic",
@@ -222,6 +272,16 @@ def main(argv: list[str] | None = None) -> int:
     p_lyrics = sub.add_parser("lyrics", help="Fetch lyrics for the current Amarok track from YouTube Music")
     p_lyrics.add_argument("video_id", nargs="?", help="Optional video ID (defaults to currently playing Amarok track)")
     p_lyrics.set_defaults(func=cmd_lyrics)
+
+    p_import = sub.add_parser("import", help="Import full metadata, cover art, lyrics, and tagged M4A to Amarok Local Collection")
+    p_import.add_argument("video_id", nargs="?", help="Optional video ID (defaults to currently playing Amarok track)")
+    p_import.add_argument("--metadata-only", action="store_true", help="Only cache SQLite metadata & cover art (skip M4A download)")
+    p_import.add_argument("--refresh", action="store_true", help="Force re-fetching metadata from YouTube Music")
+    p_import.set_defaults(func=cmd_import)
+
+    p_cache = sub.add_parser("cache", help="List auto-imported & cached YouTube Music tracks and playback stats")
+    p_cache.add_argument("--limit", type=int, default=30, help="Maximum tracks to display")
+    p_cache.set_defaults(func=cmd_cache)
 
     args = parser.parse_args(argv)
     return int(args.func(args))

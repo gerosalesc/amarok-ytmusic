@@ -25,6 +25,10 @@
   - **YouTube Music History Scrobbling**: Automatically reports tracks played in Amarok (`>= 15s`) to your YouTube Music listening history so your recommendations stay up to date.
   - **Two-Way Like / Rating Sync**: Rating a playing track 4–5 stars in Amarok (or clicking **♥ Like** in the Web UI / CLI) likes the song on YouTube Music; Liked Music tracks also report 5 stars (`<rating>5</rating>`) to Amarok.
   - **Persistent Ampache IDs**: Saves assigned album/song IDs in `~/.config/amarok-ytmusic/ampache_state.json` so queued tracks and collection IDs survive daemon restarts.
+  - **Automated On-Play Metadata, User-Stats & Local Collection Import**:
+    - Every time a YouTube Music song is played, automatically fetches & caches rich metadata (`title`, `artist`, `album`, `year`, high-res cover art, lyrics, `likeStatus`, `inLibrary`) plus user playback statistics (`play_count`, `score`, `first_played`, `last_played`) in SQLite (`~/.config/amarok-ytmusic/metadata_cache.db`).
+    - Caches your user profile info locally so dashboard loads are instant.
+    - Automatically downloads and embeds full MP4 metadata (`©nam`, `©ART`, `©alb`, `©day`, `©lyr`, `covr` cover art, `©cmt=ytmusic:<videoId>`, and Amarok's native `FMPS_Rating`, `FMPS_Playcount`, `FMPS_Rating_Amarok_Score` atoms) into `~/Music/YouTube Music/<Artist>/<Album>/<Title>.m4a`—which Amarok's Local Collection automatically picks up so you get **real Cover Art, real Artist/Album, clickable Stars, Play Count, Score, and Last Played** natively inside Amarok (and instant zero-latency replay on `/stream/<videoId>`!).
   - **Live Lyrics**: View lyrics for the currently playing Amarok track from the Web UI (`http://127.0.0.1:18732`) or CLI (`amarok-ytmusic lyrics`).
 - **Future-Ready `ScriptableService` Included**:
   - Also ships `amarok_script/` (`main.js`, `script.json`, `script.spec`) and an atomic directory/file IPC watcher (`ipc_watcher.py`) ready for future Amarok 3.x releases once upstream fixes `ScriptManager::loadScript()` to call `KPluginMetaData::fromJsonFile()`.
@@ -148,6 +152,12 @@ amarok-ytmusic like [VIDEO_ID] [--dislike | --clear]
 # Fetch and display lyrics for the currently playing Amarok track
 amarok-ytmusic lyrics [VIDEO_ID]
 
+# Import/refresh full metadata, cover art, lyrics & tagged M4A into Amarok Local Collection
+amarok-ytmusic import [VIDEO_ID] [--metadata-only] [--refresh]
+
+# List auto-imported & cached YouTube Music tracks and playback statistics
+amarok-ytmusic cache [--limit 30]
+
 # Sync cookies directly from a local browser via CLI
 amarok-ytmusic auth --browser chrome [--keyring KWALLET5] [--profile Default] [--authuser 0]
 
@@ -171,17 +181,19 @@ journalctl --user -u amarok-ytmusic.service -f
 amarok-ytmusic/
 ├── amarok_script/                  # Amarok ScriptableService (main.js, script.json, script.spec)
 ├── src/amarok_ytmusic/
-│   ├── ampache_bridge.py           # Ampache XML API bridge with persistent ID cache
+│   ├── ampache_bridge.py           # Ampache XML API bridge with persistent ID cache & imported artists
 │   ├── auth.py                     # Browser cookie extraction, raw headers parser, and OAuth
 │   ├── cli.py                      # `amarok-ytmusic` CLI entrypoint
 │   ├── config.py                   # XDG/Flatpak paths and persistent settings store
 │   ├── ipc_watcher.py              # Atomic directory/file IPC watcher for ScriptableService
-│   ├── mpris_monitor.py            # MPRIS2 D-Bus monitor, history scrobbler & rating sync
-│   ├── server.py                   # FastAPI application & Range-capable /stream/{videoId} proxy
+│   ├── metadata_store.py           # SQLite cache for rich song metadata, user profile & play stats
+│   ├── mpris_monitor.py            # MPRIS2 D-Bus monitor, auto-importer, scrobbler & rating sync
+│   ├── server.py                   # FastAPI application, cover cache & Range-capable /stream proxy
 │   ├── stream_resolver.py          # yt-dlp stream resolver with TTL cache & multi-mode fallback
+│   ├── track_importer.py           # On-play metadata fetcher & Amarok FMPS-tagged M4A importer
 │   ├── ytmusic_client.py           # ytmusicapi catalog client with rating, history & lyrics
-│   └── web/index.html              # Single-file dark-mode Web Auth & Now-Playing Control UI
-├── tests/                          # Pytest unit & integration test suite (21 tests)
+│   └── web/index.html              # Single-file dark-mode Web Auth, Now-Playing & Cache UI
+├── tests/                          # Pytest unit & integration test suite (26 tests)
 ├── install.sh                      # Automated installer (uv + Amarok config + systemd user service)
 └── pyproject.toml                  # Package metadata and dependencies
 ```
