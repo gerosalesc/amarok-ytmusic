@@ -224,3 +224,33 @@ def test_stream_proxy_assembles_multiple_upstream_range_chunks(
         assert r.status_code == 200
         assert r.content == fake_audio
         assert seen_ranges == ["bytes=0-9", "bytes=10-19", "bytes=20-29", "bytes=30-35"]
+
+
+def test_stream_proxy_returns_silent_wav_for_amarok_on_unavailable_track(tmp_path: Path) -> None:
+    from amarok_ytmusic.stream_resolver import StreamResolutionError
+
+    store = SettingsStore(config_dir=tmp_path / "cfg")
+    settings = store.load()
+    settings.auto_import_metadata = False
+    store.save(settings)
+    app = create_app(store=store, ipc_dir=tmp_path / "ipc", enable_ipc=False, enable_mpris=False)
+    app.state.resolver.resolve = AsyncMock(side_effect=StreamResolutionError("Region blocked"))
+
+    with TestClient(app) as client:
+        # Normal HTTP clients still get 404
+        r_curl = client.get("/stream/hhWxbqD45EM", headers={"User-Agent": "curl/8.0"})
+        assert r_curl.status_code == 404
+
+        # Amarok / GStreamer gets a valid 120ms silent WAV so GStreamer hits clean EOS and skips without wedging
+        r_amarok = client.get("/stream/hhWxbqD45EM", headers={"User-Agent": "Amarok/3.3.3"})
+        assert r_amarok.status_code == 200
+        assert r_amarok.headers["content-type"] == "audio/wav"
+        assert r_amarok.content[:4] == b"RIFF"
+        assert r_amarok.content[8:12] == b"WAVE"
+
+        r_gst = client.get(
+            "/stream/hhWxbqD45EM",
+            headers={"User-Agent": "GStreamer souphttpsrc 1.24.0", "Range": "bytes=0-11"},
+        )
+        assert r_gst.status_code == 206
+        assert r_gst.content == r_amarok.content[:12]

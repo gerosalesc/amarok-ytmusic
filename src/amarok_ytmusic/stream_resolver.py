@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import shutil
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from .auth import AuthManager
@@ -17,7 +19,7 @@ log = logging.getLogger("amarok_ytmusic.stream")
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,20}$")
 DEFAULT_STREAM_TTL = 2.5 * 3600  # YouTube signed URLs typically live ~6h; refresh after 2.5h
 MAX_STREAM_CACHE_ENTRIES = 500
-RESOLVE_TIMEOUT_SECONDS = 12.0  # Stay safely below GStreamer souphttpsrc's 15s default timeout
+RESOLVE_TIMEOUT_SECONDS = 13.5  # Stay safely below GStreamer souphttpsrc's 15s default timeout
 
 
 @dataclass
@@ -80,6 +82,8 @@ class StreamResolver:
             return await existing
 
         task = asyncio.create_task(asyncio.to_thread(self._resolve_sync, video_id))
+        # Consume late exceptions if wait_for(shield(task)) times out before the worker thread finishes
+        task.add_done_callback(lambda t: None if t.cancelled() else t.exception())
         self._inflight[video_id] = task
         try:
             resolved = await asyncio.wait_for(asyncio.shield(task), timeout=RESOLVE_TIMEOUT_SECONDS)
@@ -102,16 +106,54 @@ class StreamResolver:
                 self._inflight.pop(video_id, None)
 
     @staticmethod
-    def _has_js_runtime() -> bool:
-        return any(shutil.which(rt) is not None for rt in ("deno", "node", "bun", "qjs"))
+    def _ensure_js_runtime_on_path() -> str | None:
+        """Ensure user-local JS runtimes (~/.deno/bin, ~/.bun/bin) are on PATH and return runtime path if found."""
+        extra_dirs = [
+            Path.home() / ".deno" / "bin",
+            Path.home() / ".bun" / "bin",
+            Path.home() / ".local" / "bin",
+        ]
+        current_path = os.environ.get("PATH", "")
+        parts = current_path.split(os.pathsep) if current_path else []
+        for d in extra_dirs:
+            ds = str(d)
+            if d.is_dir() and ds not in parts:
+                parts.insert(0, ds)
+        os.environ["PATH"] = os.pathsep.join(parts)
 
-    def _extract_with_opts(self, watch_url: str, base_opts: dict[str, Any], use_cookies: bool) -> ResolvedStream:
+        for rt in ("deno", "node", "bun", "qjs"):
+            found = shutil.which(rt)
+            if found:
+                return found
+        return None
+
+    @classmethod
+    def _has_js_runtime(cls) -> bool:
+        return cls._ensure_js_runtime_on_path() is not None
+
+    def _extract_with_opts(
+        self,
+        watch_url: str,
+        base_opts: dict[str, Any],
+        use_cookies: bool,
+        fast_tv: bool = False,
+    ) -> ResolvedStream:
         import yt_dlp
 
         opts = dict(base_opts)
         cookies_path = self.auth.store.cookies_txt_path
         if use_cookies and cookies_path.exists():
             opts["cookiefile"] = str(cookies_path)
+        if fast_tv:
+            # Skip webpage + initial_data + multi-client config downloads (web_creator/web_music) that take 6-12s;
+            # tv_samsung against www.youtube.com with cookies + deno resolves Music Premium 256+ kbps audio in ~1.8-2.5s.
+            opts["extractor_args"] = {
+                "youtube": {
+                    "player_client": ["tv_samsung"],
+                    "player_skip": ["webpage", "configs", "initial_data"],
+                }
+            }
+            watch_url = watch_url.replace("https://music.youtube.com/", "https://www.youtube.com/", 1)
 
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(watch_url, download=False)
@@ -160,7 +202,7 @@ class StreamResolver:
             "noplaylist": True,
             "format": settings.ytdlp_format_selector(),
             "extract_flat": False,
-            "socket_timeout": 8,
+            "socket_timeout": 5,
             "retries": 1,
         }
 
@@ -170,12 +212,14 @@ class StreamResolver:
 
         # yt-dlp's authenticated web clients require a JS runtime (deno/node/bun) to solve YouTube's
         # signature/n challenges; without one, cookie-less extraction (android_vr etc.) resolves audio cleanly.
+        # When both cookies and a JS runtime are present, try fast tv_samsung first (~3s, supports Music Premium
+        # 256+ kbps audio) before falling back to cookie-less and full default cookie extraction.
         if has_cookies and has_js:
-            attempts = [True, False]
+            attempts: list[tuple[bool, bool]] = [(True, True), (False, False), (True, False)]
         elif has_cookies:
-            attempts = [False, True]
+            attempts = [(False, False), (True, False)]
         else:
-            attempts = [False]
+            attempts = [(False, False)]
 
         log.info(
             "Resolving YouTube Music audio stream for %s (quality=%s, js_runtime=%s)",
@@ -185,17 +229,20 @@ class StreamResolver:
         )
 
         last_err: Exception | None = None
-        for use_cookies in attempts:
+        for use_cookies, fast_tv in attempts:
             try:
-                resolved = self._extract_with_opts(watch_url, base_opts, use_cookies=use_cookies)
+                resolved = self._extract_with_opts(
+                    watch_url, base_opts, use_cookies=use_cookies, fast_tv=fast_tv
+                )
                 resolved.video_id = video_id
                 return resolved
             except Exception as exc:
                 last_err = exc
                 log.warning(
-                    "yt-dlp resolution failed for %s (cookies=%s): %s",
+                    "yt-dlp resolution failed for %s (cookies=%s, fast_tv=%s): %s",
                     video_id,
                     use_cookies,
+                    fast_tv,
                     exc,
                 )
 

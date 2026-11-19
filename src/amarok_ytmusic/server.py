@@ -6,6 +6,7 @@ import asyncio
 import logging
 import mimetypes
 import os
+import struct
 import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict
@@ -32,6 +33,32 @@ log = logging.getLogger("amarok_ytmusic.server")
 WEB_DIR = Path(__file__).parent / "web"
 CHUNK_SIZE = 65536
 UPSTREAM_RANGE_CHUNK = 512 * 1024  # 512 KiB chunks bypass YouTube single-stream CDN throttling
+
+
+def _build_silent_wav(duration_ms: int = 120, sample_rate: int = 8000) -> bytes:
+    """Build a valid tiny PCM WAV of silence so Amarok hits clean EOS instead of wedging GStreamer on 404."""
+    num_samples = int(sample_rate * duration_ms / 1000)
+    data_size = num_samples * 2  # 16-bit mono
+    header = struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        36 + data_size,
+        b"WAVE",
+        b"fmt ",
+        16,
+        1,  # PCM
+        1,  # mono
+        sample_rate,
+        sample_rate * 2,
+        2,
+        16,
+        b"data",
+        data_size,
+    )
+    return header + (b"\x00" * data_size)
+
+
+SILENT_SKIP_WAV = _build_silent_wav()
 
 
 class BrowserExtractRequest(BaseModel):
@@ -500,22 +527,62 @@ def create_app(
             return None
         return start, min(end, total_size - 1), True
 
+    def _amarok_safe_skip_response(video_id: str, request: Request, reason: str) -> Response | None:
+        """If Amarok's GStreamer requests an unplayable track, return 120ms silence so Amarok skips cleanly.
+
+        Amarok 3.3.3's EngineGstPipeline::cb_error() never resets its GStreamer pipeline on HTTP 404/502,
+        permanently wedging playback until restart. A valid 120ms silent WAV triggers clean EOS instead.
+        """
+        ua = (request.headers.get("user-agent") or "").lower()
+        if not any(token in ua for token in ("amarok", "gstreamer", "souphttpsrc")):
+            return None
+        log.warning(
+            "Track %s unavailable (%s); returning 120ms silent WAV so Amarok advances without wedging",
+            video_id,
+            reason,
+        )
+        total = len(SILENT_SKIP_WAV)
+        parsed = _parse_range_header(request.headers.get("range"), total)
+        if parsed is None:
+            return Response(status_code=416, headers={"Content-Range": f"bytes */{total}"})
+        start, end, is_partial = parsed
+        payload = SILENT_SKIP_WAV[start : end + 1]
+        headers = {
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "no-store",
+            "Content-Length": str(len(payload)),
+        }
+        if is_partial:
+            headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+        return Response(
+            content=b"" if request.method == "HEAD" else payload,
+            status_code=206 if is_partial else 200,
+            headers=headers,
+            media_type="audio/wav",
+        )
+
     @app.api_route("/stream/{video_id}", methods=["GET", "HEAD"])
     async def stream_audio(video_id: str, request: Request) -> Response:
-        # Kick off background metadata + Local Collection import whenever Amarok plays an Ampache stream.
+        try:
+            stream, total_size, media_type = await _probe_stream_length(video_id)
+        except StreamResolutionError as exc:
+            skip = _amarok_safe_skip_response(video_id, request, str(exc))
+            if skip is not None:
+                return skip
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except httpx.HTTPError as exc:
+            skip = _amarok_safe_skip_response(video_id, request, str(exc))
+            if skip is not None:
+                return skip
+            raise HTTPException(status_code=502, detail=f"Upstream network error: {exc}") from exc
+
+        # Kick off background metadata + Local Collection import once the stream resolves cleanly.
         # Note: Keep /stream/{video_id} streaming raw upstream audio (instead of the tagged local .m4a)
         # so Amarok's GStreamer MetaStream::Track doesn't misinterpret embedded MP4 tags as a 0:00 live radio stream.
         if request.method == "GET":
             settings = settings_store.load()
             if settings.auto_import_metadata:
                 asyncio.create_task(importer.on_track_played(video_id, record_play=False))
-
-        try:
-            stream, total_size, media_type = await _probe_stream_length(video_id)
-        except StreamResolutionError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except httpx.HTTPError as exc:
-            raise HTTPException(status_code=502, detail=f"Upstream network error: {exc}") from exc
 
         range_header = request.headers.get("range")
 
@@ -547,6 +614,9 @@ def create_app(
                 if chunk_mime:
                     media_type = chunk_mime
             except StreamResolutionError as exc:
+                skip = _amarok_safe_skip_response(video_id, request, str(exc))
+                if skip is not None:
+                    return skip
                 raise HTTPException(status_code=502, detail=str(exc)) from exc
 
             async def chunked_body_iter():
@@ -576,6 +646,9 @@ def create_app(
             req = http_client.build_request(request.method, stream.url, headers=upstream_headers)
             upstream = await http_client.send(req, stream=True)
         except httpx.HTTPError as exc:
+            skip = _amarok_safe_skip_response(video_id, request, str(exc))
+            if skip is not None:
+                return skip
             raise HTTPException(status_code=502, detail=f"Upstream network error: {exc}") from exc
 
         fb_headers = {"Accept-Ranges": upstream.headers.get("accept-ranges", "bytes"), "Cache-Control": "no-store"}

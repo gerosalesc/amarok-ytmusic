@@ -260,7 +260,12 @@ class TrackImporter:
         cookies_path = self.auth.store.cookies_txt_path
         has_cookies = cookies_path.exists()
         has_js = StreamResolver._has_js_runtime()
-        attempts = [True, False] if (has_cookies and has_js) else ([False, True] if has_cookies else [False])
+        if has_cookies and has_js:
+            attempts: list[tuple[bool, bool]] = [(True, True), (False, False), (True, False)]
+        elif has_cookies:
+            attempts = [(False, False), (True, False)]
+        else:
+            attempts = [(False, False)]
 
         out_base.parent.mkdir(parents=True, exist_ok=True)
         target_m4a = out_base.with_suffix(".m4a")
@@ -268,7 +273,7 @@ class TrackImporter:
             target_m4a.unlink()
 
         last_err: Exception | None = None
-        for use_cookies in attempts:
+        for use_cookies, fast_tv in attempts:
             opts: dict[str, Any] = {
                 "quiet": True,
                 "no_warnings": True,
@@ -276,21 +281,36 @@ class TrackImporter:
                 "format": "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[ext=mp4]/bestaudio",
                 "outtmpl": str(out_base) + ".%(ext)s",
                 "overwrites": True,
-                "socket_timeout": 10,
+                "socket_timeout": 6,
                 "retries": 2,
             }
             if use_cookies and cookies_path.exists():
                 opts["cookiefile"] = str(cookies_path)
+            target_url = watch_url
+            if fast_tv:
+                opts["extractor_args"] = {
+                    "youtube": {
+                        "player_client": ["tv_samsung"],
+                        "player_skip": ["webpage", "configs", "initial_data"],
+                    }
+                }
+                target_url = f"https://www.youtube.com/watch?v={video_id}"
             try:
                 with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(watch_url, download=True)
+                    info = ydl.extract_info(target_url, download=True)
                     ext = str((info or {}).get("ext") or "m4a")
                     downloaded = out_base.with_suffix(f".{ext}")
                     if downloaded.exists() and downloaded.stat().st_size > 1000:
                         return downloaded
             except Exception as exc:
                 last_err = exc
-                log.warning("Audio cache download failed for %s (cookies=%s): %s", video_id, use_cookies, exc)
+                log.warning(
+                    "Audio cache download failed for %s (cookies=%s, fast_tv=%s): %s",
+                    video_id,
+                    use_cookies,
+                    fast_tv,
+                    exc,
+                )
 
         raise RuntimeError(f"Could not download M4A audio for {video_id}: {last_err}")
 

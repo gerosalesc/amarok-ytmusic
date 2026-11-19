@@ -97,6 +97,7 @@ ExecStart=$PROJECT_DIR/.venv/bin/amarok-ytmusic serve --host 127.0.0.1 --port 18
 Restart=on-failure
 RestartSec=3
 Environment=PYTHONUNBUFFERED=1
+Environment="PATH=$HOME/.deno/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
 
 [Install]
 WantedBy=default.target

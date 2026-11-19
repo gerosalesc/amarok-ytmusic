@@ -16,10 +16,11 @@
   - **Paste Request Headers**: Universal DevTools fallback.
   - **Google OAuth (TV Client)**: Optional device-code flow.
   - All credentials are stored strictly locally in `~/.config/amarok-ytmusic/` with `0600` permissions.
-- **Never-Expiring Playlist Streams & GStreamer Seeking**:
+- **Never-Expiring Playlist Streams, Anti-Throttling Proxy & GStreamer Seeking**:
   - Every track gets a permanent local proxy URL (`http://127.0.0.1:18732/stream/<videoId>`), so saved Amarok playlists never expire.
-  - Resolves fresh YouTube audio URLs just-in-time via `yt-dlp` (with automatic fallback when no external JS runtime is installed, and automatic retry if an upstream signed URL expires with `HTTP 403/410`).
-  - Full `HTTP 206 Partial Content` (`Range` / `Accept-Ranges: bytes`) support for smooth seeking in Amarok's GStreamer engine.
+  - Resolves fresh YouTube audio URLs just-in-time via `yt-dlp[default]` (`yt-dlp-ejs` + auto-discovered `deno`/`node`/`bun` JS runtime for YouTube Music Premium 256+ kbps streams, with automatic cookie-less fallback when no JS runtime is installed and automatic retry if an upstream signed URL expires with `HTTP 403/410`).
+  - Streams upstream YouTube CDN audio in 512 KiB HTTP `Range` chunks to bypass YouTube's single-connection throttling (~32 KB/s) and pause timeouts, while exposing full `HTTP 206 Partial Content` (`Range` / `Accept-Ranges: bytes`) seeking to Amarok's GStreamer engine.
+  - **Amarok-Safe Skip Guard**: If a track is genuinely deleted or region-blocked, returns a 120 ms silent WAV (`audio/wav`) to Amarok/GStreamer so it hits a clean `EOS` and advances to the next track instead of triggering Amarok 3.3.3's `EngineGstPipeline::cb_error()` wedge bug (non-Amarok HTTP clients still receive standard `404`/`502`).
 - **MPRIS2 Live Sync, Scrobbling, Two-Way Ratings & Lyrics**:
   - Monitors Amarok's `org.mpris.MediaPlayer2.Player` D-Bus interface in real time (`mpris_monitor.py`).
   - **YouTube Music History Scrobbling**: Automatically reports tracks played in Amarok (`>= 15s`) to your YouTube Music listening history so your recommendations stay up to date.
@@ -80,7 +81,7 @@ flowchart LR
   flatpak install flathub org.kde.amarok
   ```
 - **Python 3.11+** and **[uv](https://docs.astral.sh/uv/)** package manager.
-- *(Optional)* `deno` or `nodejs` on `PATH` if you want `yt-dlp` to use cookie-authenticated web extraction first for YouTube Music Premium 256 kbps or private uploaded tracks (standard public/library tracks stream out of the box without any JS runtime).
+- *(Recommended for YouTube Music Premium)* **`deno`** (e.g. `curl -fsSL https://deno.land/install.sh | sh`) or `nodejs` on `PATH` (or `~/.deno/bin`, auto-discovered by the daemon) so `yt-dlp-ejs` can run cookie-authenticated extraction for YouTube Music Premium-only tracks (up to 273 kbps Opus / 258 kbps AAC) and private uploads. Public/non-Premium tracks still stream without a JS runtime.
 
 ---
 
@@ -193,7 +194,7 @@ amarok-ytmusic/
 │   ├── track_importer.py           # On-play metadata fetcher & Amarok FMPS-tagged M4A importer
 │   ├── ytmusic_client.py           # ytmusicapi catalog client with rating, history & lyrics
 │   └── web/index.html              # Single-file dark-mode Web Auth, Now-Playing & Cache UI
-├── tests/                          # Pytest unit & integration test suite (26 tests)
+├── tests/                          # Pytest unit & integration test suite (28 tests)
 ├── install.sh                      # Automated installer (uv + Amarok config + systemd user service)
 └── pyproject.toml                  # Package metadata and dependencies
 ```
