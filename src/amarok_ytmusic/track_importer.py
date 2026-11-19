@@ -276,6 +276,8 @@ class TrackImporter:
                 "format": "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[ext=mp4]/bestaudio",
                 "outtmpl": str(out_base) + ".%(ext)s",
                 "overwrites": True,
+                "socket_timeout": 10,
+                "retries": 2,
             }
             if use_cookies and cookies_path.exists():
                 opts["cookiefile"] = str(cookies_path)
@@ -421,6 +423,9 @@ class TrackImporter:
 
         async def _worker() -> CachedTrack | None:
             try:
+                # Yield briefly when auto-triggered so Amarok's GStreamer stream gets priority on bandwidth & YouTube
+                if not force_collection_import and not force_refresh:
+                    await asyncio.sleep(2.5)
                 if record_play:
                     await asyncio.to_thread(self.store.record_play, video_id)
                 if force_collection_import or settings.auto_import_collection:

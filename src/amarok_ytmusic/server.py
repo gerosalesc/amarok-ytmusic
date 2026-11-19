@@ -145,7 +145,7 @@ def create_app(
         nonlocal http_client
         http_client = httpx.AsyncClient(
             follow_redirects=True,
-            timeout=httpx.Timeout(connect=15.0, read=30.0, write=15.0, pool=15.0),
+            timeout=httpx.Timeout(connect=6.0, read=20.0, write=10.0, pool=6.0),
         )
         if watcher:
             watcher.start()

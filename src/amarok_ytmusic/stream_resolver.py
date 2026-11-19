@@ -17,6 +17,7 @@ log = logging.getLogger("amarok_ytmusic.stream")
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,20}$")
 DEFAULT_STREAM_TTL = 2.5 * 3600  # YouTube signed URLs typically live ~6h; refresh after 2.5h
 MAX_STREAM_CACHE_ENTRIES = 500
+RESOLVE_TIMEOUT_SECONDS = 12.0  # Stay safely below GStreamer souphttpsrc's 15s default timeout
 
 
 @dataclass
@@ -81,7 +82,7 @@ class StreamResolver:
         task = asyncio.create_task(asyncio.to_thread(self._resolve_sync, video_id))
         self._inflight[video_id] = task
         try:
-            resolved = await task
+            resolved = await asyncio.wait_for(asyncio.shield(task), timeout=RESOLVE_TIMEOUT_SECONDS)
             if len(self._cache) >= MAX_STREAM_CACHE_ENTRIES:
                 now = time.time()
                 expired = [k for k, v in self._cache.items() if now >= v.expires_at]
@@ -92,6 +93,10 @@ class StreamResolver:
                     self._cache.pop(oldest, None)
             self._cache[video_id] = resolved
             return resolved
+        except asyncio.TimeoutError as exc:
+            raise StreamResolutionError(
+                f"Timed out resolving YouTube Music stream for {video_id} after {RESOLVE_TIMEOUT_SECONDS:.0f}s"
+            ) from exc
         finally:
             if self._inflight.get(video_id) is task:
                 self._inflight.pop(video_id, None)
@@ -155,6 +160,8 @@ class StreamResolver:
             "noplaylist": True,
             "format": settings.ytdlp_format_selector(),
             "extract_flat": False,
+            "socket_timeout": 8,
+            "retries": 1,
         }
 
         watch_url = f"https://music.youtube.com/watch?v={video_id}"
