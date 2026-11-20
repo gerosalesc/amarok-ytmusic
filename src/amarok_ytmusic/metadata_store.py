@@ -6,11 +6,47 @@ import sqlite3
 import threading
 import time
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 METADATA_TTL_SECONDS = 24 * 3600  # Refresh remote metadata/like_status after 24 hours
 PROFILE_TTL_SECONDS = 6 * 3600    # Refresh user profile cache after 6 hours
+
+
+def format_last_played(ts: float, now: float | None = None) -> str:
+    """Format a Unix timestamp into an Amarok-style human-readable 'Last played' label."""
+    if not ts or ts <= 0:
+        return "Never"
+    cur = time.time() if now is None else now
+    delta = max(0.0, cur - ts)
+    if delta < 60:
+        return "Just now"
+    if delta < 3600:
+        mins = int(delta // 60)
+        return "1 minute ago" if mins == 1 else f"{mins} minutes ago"
+    if delta < 24 * 3600:
+        hrs = int(delta // 3600)
+        return "1 hour ago" if hrs == 1 else f"{hrs} hours ago"
+    dt = datetime.fromtimestamp(ts)
+    now_dt = datetime.fromtimestamp(cur)
+    day_diff = (now_dt.date() - dt.date()).days
+    if day_diff == 1:
+        return "Yesterday"
+    if day_diff < 7:
+        return f"{day_diff} days ago"
+    if dt.year == now_dt.year:
+        return dt.strftime("%b %d")
+    return dt.strftime("%b %d, %Y")
+
+
+def amarok_rating_to_like_status(amarok_rating: int) -> str:
+    """Map an Amarok 0..10 star rating to a YouTube Music LikeStatus string."""
+    if amarok_rating >= 8:  # 4 or 5 stars
+        return "LIKE"
+    if 1 <= amarok_rating <= 2:  # 0.5 or 1 star
+        return "DISLIKE"
+    return "INDIFFERENT"  # 0 (cleared) or 1.5..3.5 stars
 
 
 @dataclass
@@ -25,6 +61,7 @@ class CachedTrack:
     cover_url: str = ""
     cover_local_path: str = ""
     like_status: str = ""  # "LIKE" | "DISLIKE" | "INDIFFERENT" | ""
+    user_rating: int = -1  # -1 = unset (derive from like_status); 0..10 = explicit Amarok star rating
     in_library: bool = False
     lyrics: str = ""
     lyrics_source: str = ""
@@ -35,17 +72,26 @@ class CachedTrack:
     local_file_path: str = ""
     fetched_at: float = 0.0
 
-    def amarok_rating_float(self) -> float:
-        """Convert YouTube Music like_status into Amarok FMPS_Rating (0.0..1.0)."""
+    def effective_amarok_rating(self) -> int:
+        """Return Amarok's 0..10 star scale (10 = 5 stars, 2 = 1 star, 0 = unrated)."""
+        if self.user_rating >= 0:
+            return max(0, min(10, int(self.user_rating)))
         if self.like_status == "LIKE":
-            return 1.0
+            return 10
         if self.like_status == "DISLIKE":
-            return 0.2
-        return 0.0
+            return 2
+        return 0
+
+    def amarok_rating_float(self) -> float:
+        """Convert effective rating into Amarok FMPS_Rating (0.0..1.0)."""
+        return round(self.effective_amarok_rating() / 10.0, 2)
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
+        d["amarokRating"] = self.effective_amarok_rating()
         d["ratingFloat"] = self.amarok_rating_float()
+        d["scoreDisplay"] = int(round(self.score))
+        d["lastPlayedDisplay"] = format_last_played(self.last_played)
         d["hasLocalFile"] = bool(self.local_file_path and Path(self.local_file_path).exists())
         return d
 
@@ -99,6 +145,7 @@ class MetadataStore:
                     cover_url TEXT NOT NULL DEFAULT '',
                     cover_local_path TEXT NOT NULL DEFAULT '',
                     like_status TEXT NOT NULL DEFAULT '',
+                    user_rating INTEGER NOT NULL DEFAULT -1,
                     in_library INTEGER NOT NULL DEFAULT 0,
                     lyrics TEXT NOT NULL DEFAULT '',
                     lyrics_source TEXT NOT NULL DEFAULT '',
@@ -123,6 +170,10 @@ class MetadataStore:
                 );
                 """
             )
+            # Safe schema migration for existing DBs created before user_rating column existed
+            cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(tracks)").fetchall()}
+            if "user_rating" not in cols:
+                conn.execute("ALTER TABLE tracks ADD COLUMN user_rating INTEGER NOT NULL DEFAULT -1")
 
     @staticmethod
     def _row_to_track(row: sqlite3.Row) -> CachedTrack:
@@ -137,6 +188,7 @@ class MetadataStore:
             cover_url=str(row["cover_url"]),
             cover_local_path=str(row["cover_local_path"]),
             like_status=str(row["like_status"]),
+            user_rating=int(row["user_rating"]) if "user_rating" in row.keys() else -1,
             in_library=bool(row["in_library"]),
             lyrics=str(row["lyrics"]),
             lyrics_source=str(row["lyrics_source"]),
@@ -175,12 +227,17 @@ class MetadataStore:
                     cover_url=track.cover_url or ex.cover_url,
                     cover_local_path=track.cover_local_path or ex.cover_local_path,
                     like_status=track.like_status if track.like_status else ex.like_status,
+                    user_rating=track.user_rating if track.user_rating >= 0 else ex.user_rating,
                     in_library=track.in_library or ex.in_library,
                     lyrics=track.lyrics or ex.lyrics,
                     lyrics_source=track.lyrics_source or ex.lyrics_source,
                     play_count=max(track.play_count, ex.play_count),
                     score=max(track.score, ex.score),
-                    first_played=ex.first_played or track.first_played,
+                    first_played=(
+                        min(t for t in (ex.first_played, track.first_played) if t > 0)
+                        if (ex.first_played > 0 or track.first_played > 0)
+                        else 0.0
+                    ),
                     last_played=max(track.last_played, ex.last_played),
                     local_file_path=track.local_file_path or ex.local_file_path,
                     fetched_at=track.fetched_at or time.time(),
@@ -194,9 +251,9 @@ class MetadataStore:
                 """
                 INSERT OR REPLACE INTO tracks (
                     video_id, title, artist, album, album_browse_id, year, duration_sec,
-                    cover_url, cover_local_path, like_status, in_library, lyrics, lyrics_source,
+                    cover_url, cover_local_path, like_status, user_rating, in_library, lyrics, lyrics_source,
                     play_count, score, first_played, last_played, local_file_path, fetched_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     merged.video_id,
@@ -209,6 +266,7 @@ class MetadataStore:
                     merged.cover_url,
                     merged.cover_local_path,
                     merged.like_status,
+                    merged.user_rating,
                     int(merged.in_library),
                     merged.lyrics,
                     merged.lyrics_source,
@@ -243,17 +301,112 @@ class MetadataStore:
             track.last_played = now
             return self.upsert_metadata(track)
 
-    def update_like_status(self, video_id: str, like_status: str) -> CachedTrack | None:
+    def update_last_play_score(
+        self,
+        video_id: str,
+        played_fraction: float,
+        pre_play_score: float | None = None,
+    ) -> CachedTrack | None:
+        """Refine the Amarok score for the currently recorded play as playback progresses (no double-count)."""
+        pct = max(10.0, min(100.0, played_fraction * 100.0))
         with self._lock, self._connect() as conn:
             row = conn.execute("SELECT * FROM tracks WHERE video_id = ?", (video_id,)).fetchone()
             if not row:
-                track = CachedTrack(video_id=video_id, like_status=like_status)
+                return None
+            track = self._row_to_track(row)
+            if track.play_count <= 0:
+                return track
+            if track.play_count == 1:
+                candidate = round((50.0 + pct) / 2.0, 1)
+            else:
+                prev_plays = track.play_count - 1
+                base = track.score if pre_play_score is None else pre_play_score
+                candidate = round(((base * prev_plays) + pct) / track.play_count, 1)
+            new_score = min(100.0, max(0.0, candidate))
+            if abs(new_score - track.score) >= 0.1:
+                conn.execute("UPDATE tracks SET score = ? WHERE video_id = ?", (new_score, video_id))
+                track.score = new_score
+            return track
+
+    def set_user_rating(
+        self,
+        video_id: str,
+        amarok_rating: int,
+        like_status: str | None = None,
+    ) -> CachedTrack:
+        """Persist an explicit Amarok 0..10 star rating (and optional synced YouTube Music like_status)."""
+        clamped = max(0, min(10, int(amarok_rating)))
+        derived_like = like_status if like_status is not None else amarok_rating_to_like_status(clamped)
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT * FROM tracks WHERE video_id = ?", (video_id,)).fetchone()
+            if not row:
+                track = CachedTrack(video_id=video_id, user_rating=clamped, like_status=derived_like)
                 return self.upsert_metadata(track)
             conn.execute(
-                "UPDATE tracks SET like_status = ? WHERE video_id = ?",
-                (like_status, video_id),
+                "UPDATE tracks SET user_rating = ?, like_status = ? WHERE video_id = ?",
+                (clamped, derived_like, video_id),
             )
-            return self.get_track(video_id)
+            updated_row = conn.execute("SELECT * FROM tracks WHERE video_id = ?", (video_id,)).fetchone()
+            assert updated_row is not None
+            return self._row_to_track(updated_row)
+
+    def update_like_status(self, video_id: str, like_status: str) -> CachedTrack | None:
+        mapped_rating = 10 if like_status == "LIKE" else (2 if like_status == "DISLIKE" else 0)
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT * FROM tracks WHERE video_id = ?", (video_id,)).fetchone()
+            if not row:
+                track = CachedTrack(video_id=video_id, like_status=like_status, user_rating=mapped_rating)
+                return self.upsert_metadata(track)
+            conn.execute(
+                "UPDATE tracks SET like_status = ?, user_rating = ? WHERE video_id = ?",
+                (like_status, mapped_rating, video_id),
+            )
+            updated_row = conn.execute("SELECT * FROM tracks WHERE video_id = ?", (video_id,)).fetchone()
+            return self._row_to_track(updated_row) if updated_row else None
+
+    def merge_local_amarok_stats(
+        self,
+        video_id: str,
+        *,
+        play_count: int = 0,
+        score: float = 0.0,
+        user_rating: int = -1,
+        first_played: float = 0.0,
+        last_played: float = 0.0,
+    ) -> CachedTrack | None:
+        """Merge statistics retrieved from Amarok's Local Collection into the SQLite cache."""
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT * FROM tracks WHERE video_id = ?", (video_id,)).fetchone()
+            track = self._row_to_track(row) if row else CachedTrack(video_id=video_id)
+
+            new_play_count = max(track.play_count, max(0, int(play_count)))
+            new_score = round(max(track.score, max(0.0, min(100.0, float(score)))), 1)
+            # Only adopt Amarok's local rating if user hasn't explicitly rated via our bridge (or local rating is non-zero)
+            new_user_rating = track.user_rating
+            if user_rating > 0 and track.user_rating < 0:
+                new_user_rating = max(0, min(10, int(user_rating)))
+
+            candidates_first = [t for t in (track.first_played, float(first_played)) if t > 0]
+            new_first = min(candidates_first) if candidates_first else 0.0
+            new_last = max(track.last_played, max(0.0, float(last_played)))
+
+            changed = (
+                row is None
+                or new_play_count != track.play_count
+                or abs(new_score - track.score) >= 0.1
+                or new_user_rating != track.user_rating
+                or abs(new_first - track.first_played) >= 1.0
+                or abs(new_last - track.last_played) >= 1.0
+            )
+            if not changed:
+                return track
+
+            track.play_count = new_play_count
+            track.score = new_score
+            track.user_rating = new_user_rating
+            track.first_played = new_first
+            track.last_played = new_last
+            return self.upsert_metadata(track)
 
     def set_local_file_path(self, video_id: str, file_path: str) -> None:
         with self._lock, self._connect() as conn:

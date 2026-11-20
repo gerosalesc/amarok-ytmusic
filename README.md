@@ -24,7 +24,11 @@
 - **MPRIS2 Live Sync, Scrobbling, Two-Way Ratings & Lyrics**:
   - Monitors Amarok's `org.mpris.MediaPlayer2.Player` D-Bus interface in real time (`mpris_monitor.py`).
   - **YouTube Music History Scrobbling**: Automatically reports tracks played in Amarok (`>= 15s`) to your YouTube Music listening history so your recommendations stay up to date.
-  - **Two-Way Like / Rating Sync**: Rating a playing track 4–5 stars in Amarok (or clicking **♥ Like** in the Web UI / CLI) likes the song on YouTube Music; Liked Music tracks also report 5 stars (`<rating>5</rating>`) to Amarok.
+  - **Two-Way Like / Fine-Grained Star Rating Sync**: Click any star (0–5★ / half-stars) directly inside Amarok's **Current Track** panel—even when playing from `Ampache (YouTube Music)`—to persist exact ratings locally, tag imported `.m4a` files (`FMPS_Rating`), and sync 4–5★ Likes / 1★ Dislikes back to YouTube Music.
+  - **Live Local Score, Play History, Cover Art & Lyrics in Amarok Context Applets**:
+    - Installs user-level KDE `KPackage` overrides for Amarok's **Current Track** (`org.kde.amarok.currenttrack`) and **Lyrics** (`org.kde.amarok.lyrics`) applets (`~/.var/app/org.kde.amarok/data/kpackage/amarok/`).
+    - Because Amarok 3.3.3's `AmpacheTrack` returns an empty dummy `Statistics` object, the enhanced **Current Track** applet bridges live local history (`Play Count`, Amarok `Score`, `Last played`), clickable 5-star rating, high-res cover art, and real artist/album names straight from SQLite + Amarok's Local Collection D-Bus (`org.kde.amarok.Collection.Query`)—while leaving non-YouTube local tracks 100% stock.
+    - The enhanced **Lyrics** applet displays YouTube Music lyrics directly inside Amarok's built-in Lyrics pane whenever Amarok's built-in lyrics engine is empty.
   - **Persistent Ampache IDs**: Saves assigned album/song IDs in `~/.config/amarok-ytmusic/ampache_state.json` so queued tracks and collection IDs survive daemon restarts.
   - **Automated On-Play Metadata, User-Stats & Local Collection Import**:
     - Every time a YouTube Music song is played, automatically fetches & caches rich metadata (`title`, `artist`, `album`, `year`, high-res cover art, lyrics, `likeStatus`, `inLibrary`) plus user playback statistics (`play_count`, `score`, `first_played`, `last_played`) in SQLite (`~/.config/amarok-ytmusic/metadata_cache.db`).
@@ -180,6 +184,7 @@ journalctl --user -u amarok-ytmusic.service -f
 
 ```text
 amarok-ytmusic/
+├── amarok_kpackage/                # KDE KPackage QML overrides (Current Track stats/rating/cover + Lyrics)
 ├── amarok_script/                  # Amarok ScriptableService (main.js, script.json, script.spec)
 ├── src/amarok_ytmusic/
 │   ├── ampache_bridge.py           # Ampache XML API bridge with persistent ID cache & imported artists
@@ -194,7 +199,7 @@ amarok-ytmusic/
 │   ├── track_importer.py           # On-play metadata fetcher & Amarok FMPS-tagged M4A importer
 │   ├── ytmusic_client.py           # ytmusicapi catalog client with rating, history & lyrics
 │   └── web/index.html              # Single-file dark-mode Web Auth, Now-Playing & Cache UI
-├── tests/                          # Pytest unit & integration test suite (28 tests)
+├── tests/                          # Pytest unit & integration test suite (31 tests)
 ├── install.sh                      # Automated installer (uv + Amarok config + systemd user service)
 └── pyproject.toml                  # Package metadata and dependencies
 ```

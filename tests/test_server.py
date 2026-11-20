@@ -254,3 +254,29 @@ def test_stream_proxy_returns_silent_wav_for_amarok_on_unavailable_track(tmp_pat
         )
         assert r_gst.status_code == 206
         assert r_gst.content == r_amarok.content[:12]
+
+
+def test_rate_track_with_amarok_star_scale_updates_cache_and_now_playing(tmp_path: Path) -> None:
+    store = SettingsStore(config_dir=tmp_path / "cfg")
+    app = create_app(store=store, ipc_dir=tmp_path / "ipc", enable_ipc=False, enable_mpris=False)
+    app.state.catalog.rate_track = MagicMock(return_value={"ok": True, "videoId": "RJRl5zKyEls", "rating": "LIKE"})
+
+    with TestClient(app) as client:
+        # Rate 4 stars (8/10) from the Amarok Current Track applet
+        r = client.post("/api/tracks/RJRl5zKyEls/rate", json={"amarok_rating": 8})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ok"] is True
+        assert body["amarokRating"] == 8
+        assert body["rating"] == "LIKE"
+
+        cached = app.state.metadata_store.get_track("RJRl5zKyEls")
+        assert cached is not None
+        assert cached.effective_amarok_rating() == 8
+        assert cached.like_status == "LIKE"
+
+        # Rate 3 stars (6/10) -> preserves 6/10 locally and maps to INDIFFERENT on YT Music
+        r2 = client.post("/api/tracks/RJRl5zKyEls/rate", json={"amarok_rating": 6})
+        assert r2.status_code == 200
+        assert r2.json()["amarokRating"] == 6
+        assert r2.json()["rating"] == "INDIFFERENT"

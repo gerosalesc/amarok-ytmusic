@@ -5,7 +5,13 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from amarok_ytmusic.metadata_store import CachedTrack, CachedUserProfile, MetadataStore
+from amarok_ytmusic.metadata_store import (
+    CachedTrack,
+    CachedUserProfile,
+    MetadataStore,
+    amarok_rating_to_like_status,
+    format_last_played,
+)
 
 
 def test_metadata_store_upsert_merges_and_preserves_stats(tmp_path: Path) -> None:
@@ -92,3 +98,52 @@ def test_user_profile_cache_and_expiry(tmp_path: Path) -> None:
 
     store.clear_user_profile()
     assert store.get_user_profile(max_age=0) is None
+
+
+def test_user_rating_score_refinement_and_local_merge(tmp_path: Path) -> None:
+    store = MetadataStore(tmp_path / "metadata_cache.db")
+
+    # Star rating persistence (0..10 scale) + mapping to YT Music like_status
+    assert amarok_rating_to_like_status(10) == "LIKE"
+    assert amarok_rating_to_like_status(8) == "LIKE"
+    assert amarok_rating_to_like_status(6) == "INDIFFERENT"
+    assert amarok_rating_to_like_status(2) == "DISLIKE"
+    assert amarok_rating_to_like_status(0) == "INDIFFERENT"
+
+    rated = store.set_user_rating("RJRl5zKyEls", 7)
+    assert rated.effective_amarok_rating() == 7
+    assert rated.amarok_rating_float() == 0.7
+    assert rated.like_status == "INDIFFERENT"
+
+    # Score refinement on current play (no play_count double-increment)
+    p1 = store.record_play("RJRl5zKyEls", played_fraction=0.5)
+    assert p1.play_count == 1
+    assert p1.score == 50.0
+
+    refined = store.update_last_play_score("RJRl5zKyEls", played_fraction=1.0, pre_play_score=0.0)
+    assert refined is not None
+    assert refined.play_count == 1
+    assert refined.score == 75.0
+
+    # Merging higher local Amarok SqlCollection stats preserves explicit user_rating while adopting higher counts/scores
+    merged = store.merge_local_amarok_stats(
+        "RJRl5zKyEls",
+        play_count=4,
+        score=88.5,
+        user_rating=10,  # should not overwrite explicit 7
+        first_played=1700000000.0,
+        last_played=1795182900.0,
+    )
+    assert merged is not None
+    assert merged.play_count == 4
+    assert merged.score == 88.5
+    assert merged.effective_amarok_rating() == 7
+    assert merged.first_played == 1700000000.0
+    assert merged.last_played >= 1795182900.0
+
+    # Human-readable last played labels
+    now = 1795183000.0
+    assert format_last_played(0.0, now=now) == "Never"
+    assert format_last_played(now - 20, now=now) == "Just now"
+    assert format_last_played(now - 300, now=now) == "5 minutes ago"
+    assert format_last_played(now - 7200, now=now) == "2 hours ago"

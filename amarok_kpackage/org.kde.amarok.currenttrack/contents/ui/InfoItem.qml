@@ -1,0 +1,105 @@
+/****************************************************************************************
+ * Copyright (c) 2017 Malte Veerman <malte.veerman@gmail.com>                           *
+ * Copyright (c) 2026 amarok-ytmusic contributors                                       *
+ *                                                                                      *
+ * This program is free software; you can redistribute it and/or modify it under        *
+ * the terms of the GNU General Public License as published by the Free Software        *
+ * Foundation; either version 2 of the License, or (at your option) any later           *
+ * version.                                                                             *
+ *                                                                                      *
+ * This program is distributed in the hope that it will be useful, but WITHOUT ANY      *
+ * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A      *
+ * PARTICULAR PURPOSE. See the GNU General Public License for more details.             *
+ *                                                                                      *
+ * You should have received a copy of the GNU General Public License along with         *
+ * this program.  If not, see <http://www.gnu.org/licenses/>.                           *
+ ****************************************************************************************/
+
+import QtQuick 2.15
+import QtQuick.Controls 2.15
+import QtQuick.Layouts 1.15
+import org.kde.kirigami 2.14 as Kirigami
+import org.kde.amarok.currenttrack 1.0
+
+ColumnLayout {
+    id: root
+
+    property bool ytActive: false
+    property string ytTitle: ""
+    property string ytArtist: ""
+    property string ytAlbum: ""
+
+    property alias title: titleLabel.text
+    property alias album: albumLabel.text
+    property alias artist: artistLabel.text
+
+    spacing: Kirigami.Units.smallSpacing
+
+    Label {
+        id: titleLabel
+
+        text: (root.ytActive && root.ytTitle !== "") ? root.ytTitle : CurrentTrackEngine.track
+        textFormat: Text.PlainText
+
+        Layout.fillHeight: true
+        Layout.fillWidth: true
+
+        horizontalAlignment: Text.AlignLeft
+        verticalAlignment: Text.AlignVCenter
+        color: Kirigami.Theme.textColor
+        maximumLineCount: 1
+        fontSizeMode: Text.Fit
+        font.pointSize: root.parent.flow == GridLayout.TopToBottom ? 24 : 32
+        minimumPointSize: 12
+        elide: Text.ElideRight
+
+        CopyArea {
+            targetText: titleLabel.text
+        }
+    }
+    Label {
+        id: artistLabel
+
+        text: (root.ytActive && root.ytArtist !== "") ? root.ytArtist : CurrentTrackEngine.artist
+        textFormat: Text.PlainText
+
+        Layout.fillHeight: true
+        Layout.fillWidth: true
+
+        horizontalAlignment: Text.AlignLeft
+        verticalAlignment: Text.AlignVCenter
+        color: Kirigami.Theme.textColor
+        maximumLineCount: 1
+        fontSizeMode: Text.Fit
+        font.pointSize: root.parent.flow == GridLayout.TopToBottom ? 24 : 32
+        font.italic: true
+        minimumPointSize: 12
+        elide: Text.ElideRight
+
+        CopyArea {
+            targetText: artistLabel.text
+        }
+    }
+    Label {
+        id: albumLabel
+
+        text: (root.ytActive && root.ytAlbum !== "") ? root.ytAlbum : CurrentTrackEngine.album
+        textFormat: Text.PlainText
+
+        Layout.fillHeight: true
+        Layout.fillWidth: true
+
+        horizontalAlignment: Text.AlignLeft
+        verticalAlignment: Text.AlignVCenter
+        color: Kirigami.Theme.textColor
+        maximumLineCount: 1
+        fontSizeMode: Text.Fit
+        font.pointSize: root.parent.flow == GridLayout.TopToBottom ? 24 : 32
+        minimumPointSize: 12
+        elide: Text.ElideRight
+
+        CopyArea {
+            targetText: albumLabel.text
+        }
+    }
+}

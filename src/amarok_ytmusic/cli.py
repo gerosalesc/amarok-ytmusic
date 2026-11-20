@@ -57,7 +57,13 @@ def cmd_serve(args: argparse.Namespace) -> int:
     if args.open_auth:
         _open_browser_later(url)
 
-    uvicorn.run(app, host=settings.host, port=settings.port, log_level="debug" if args.debug else "info")
+    uvicorn.run(
+        app,
+        host=settings.host,
+        port=settings.port,
+        log_level="debug" if args.debug else "info",
+        timeout_graceful_shutdown=3,
+    )
     return 0
 
 

@@ -31,6 +31,44 @@ if [[ -d "$HOME/.local/share/amarok" ]]; then
     install_script_to "$NATIVE_SCRIPT_DIR"
 fi
 
+echo "==> Installing Amarok Context Applets (Current Track + Lyrics YouTube Music integration)..."
+install_kpackage_applets() {
+    local target_base="$1"
+    local sys_base=""
+    for candidate in \
+        "/var/lib/flatpak/app/org.kde.amarok/current/active/files/share/kpackage/amarok" \
+        "$HOME/.local/share/flatpak/app/org.kde.amarok/current/active/files/share/kpackage/amarok" \
+        "/usr/share/kpackage/amarok" \
+        "/usr/local/share/kpackage/amarok"; do
+        if [[ -d "$candidate/org.kde.amarok.currenttrack" ]]; then
+            sys_base="$candidate"
+            break
+        fi
+    done
+
+    if [[ -z "$sys_base" ]]; then
+        echo "    Skipped KPackage applet install (could not locate stock Amarok kpackage directory)"
+        return 0
+    fi
+
+    for pkg in org.kde.amarok.currenttrack org.kde.amarok.lyrics; do
+        if [[ -d "$sys_base/$pkg" && -d "$PROJECT_DIR/amarok_kpackage/$pkg" ]]; then
+            mkdir -p "$target_base/$pkg"
+            cp -a "$sys_base/$pkg/." "$target_base/$pkg/"
+            cp -a "$PROJECT_DIR/amarok_kpackage/$pkg/." "$target_base/$pkg/"
+            echo "    Installed $pkg -> $target_base/$pkg"
+        fi
+    done
+}
+
+if [[ -d "$HOME/.var/app/org.kde.amarok" ]] || flatpak info org.kde.amarok >/dev/null 2>&1; then
+    install_kpackage_applets "$HOME/.var/app/org.kde.amarok/data/kpackage/amarok"
+fi
+
+if [[ -d "$HOME/.local/share/amarok" ]]; then
+    install_kpackage_applets "$HOME/.local/share/kpackage/amarok"
+fi
+
 echo "==> Configuring Amarok's native Ampache Internet Service for YouTube Music..."
 python3 - <<'PY'
 from pathlib import Path
@@ -96,6 +134,7 @@ WorkingDirectory=$PROJECT_DIR
 ExecStart=$PROJECT_DIR/.venv/bin/amarok-ytmusic serve --host 127.0.0.1 --port 18732
 Restart=on-failure
 RestartSec=3
+TimeoutStopSec=5
 Environment=PYTHONUNBUFFERED=1
 Environment="PATH=$HOME/.deno/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
 

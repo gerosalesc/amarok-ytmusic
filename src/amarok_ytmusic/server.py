@@ -22,7 +22,12 @@ from .ampache_bridge import AmpacheBridge
 from .auth import AuthError, AuthManager, detect_browsers
 from .config import SettingsStore, get_ipc_dir
 from .ipc_watcher import IPCWatcher
-from .metadata_store import CachedUserProfile, MetadataStore
+from .metadata_store import (
+    CachedUserProfile,
+    MetadataStore,
+    amarok_rating_to_like_status,
+    format_last_played,
+)
 from .mpris_monitor import ALLOWED_CONTROLS, MPRISMonitor
 from .stream_resolver import StreamResolutionError, StreamResolver
 from .track_importer import TrackImporter
@@ -87,7 +92,8 @@ class SettingsUpdateRequest(BaseModel):
 
 
 class RateTrackRequest(BaseModel):
-    rating: str = "LIKE"
+    rating: str | None = None  # "LIKE" | "DISLIKE" | "INDIFFERENT"
+    amarok_rating: int | None = None  # 0..10 Amarok star scale (10 = 5 stars)
 
 
 class MPRISControlRequest(BaseModel):
@@ -376,7 +382,7 @@ def create_app(
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    @app.get("/cover/{video_id}")
+    @app.api_route("/cover/{video_id}", methods=["GET", "HEAD"])
     async def get_cover_art(video_id: str) -> Response:
         cached = metadata_store.get_track(video_id)
         if cached and cached.cover_local_path and Path(cached.cover_local_path).exists():
@@ -405,9 +411,49 @@ def create_app(
     @app.post("/api/tracks/{video_id}/rate")
     async def api_rate_track(video_id: str, req: RateTrackRequest) -> dict[str, Any]:
         try:
-            res = await asyncio.to_thread(catalog.rate_track, video_id, req.rating)
-            await asyncio.to_thread(metadata_store.update_like_status, video_id, res["rating"])
+            if req.amarok_rating is not None:
+                clamped = max(0, min(10, int(req.amarok_rating)))
+                like_status = amarok_rating_to_like_status(clamped)
+                saved = await asyncio.to_thread(
+                    metadata_store.set_user_rating, video_id, clamped, like_status
+                )
+                # Keep live MPRIS snapshot immediately consistent for the Current Track applet
+                if mpris.state.video_id == video_id:
+                    mpris.state.amarok_rating = saved.effective_amarok_rating()
+                    mpris.state.user_rating = saved.amarok_rating_float()
+                    mpris.state.like_status = saved.like_status
+
+                # Sync to YouTube Music and local .m4a FMPS_Rating in the background so star clicks are instant
+                async def _bg_sync() -> None:
+                    if auth_manager.is_authenticated():
+                        try:
+                            await asyncio.to_thread(catalog.rate_track, video_id, like_status)
+                        except Exception as exc:
+                            log.warning("YouTube Music rating sync failed for %s: %s", video_id, exc)
+                    try:
+                        await asyncio.to_thread(importer.sync_tags_for_track_sync, video_id)
+                    except Exception as exc:
+                        log.warning("Local M4A rating tag sync failed for %s: %s", video_id, exc)
+
+                asyncio.create_task(_bg_sync())
+                return {
+                    "ok": True,
+                    "videoId": video_id,
+                    "amarokRating": saved.effective_amarok_rating(),
+                    "rating": like_status,
+                    "playCount": saved.play_count,
+                    "score": saved.score,
+                    "scoreDisplay": int(round(saved.score)),
+                    "lastPlayed": saved.last_played,
+                    "lastPlayedDisplay": format_last_played(saved.last_played),
+                }
+
+            target_rating = req.rating or "LIKE"
+            res = await asyncio.to_thread(catalog.rate_track, video_id, target_rating)
+            saved = await asyncio.to_thread(metadata_store.update_like_status, video_id, res["rating"])
             await asyncio.to_thread(importer.sync_tags_for_track_sync, video_id)
+            if saved:
+                res["amarokRating"] = saved.effective_amarok_rating()
             return res
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

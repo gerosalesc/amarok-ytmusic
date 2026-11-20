@@ -303,6 +303,8 @@ class AmpacheBridge:
         if not vid:
             return _xml_response(root)
         yt_rating = "LIKE" if rating >= 4 else ("DISLIKE" if rating == 1 else "INDIFFERENT")
+        if self.metadata_store:
+            self.metadata_store.set_user_rating(vid, max(0, min(10, rating * 2)), yt_rating)
         self.catalog.rate_track(vid, yt_rating)
         ET.SubElement(root, "result").text = "ok"
         return _xml_response(root)
@@ -360,10 +362,16 @@ class AmpacheBridge:
         alb_el.text = album_entry.title
         ET.SubElement(el, "track").text = str(track_num)
         ET.SubElement(el, "time").text = str(parse_duration_seconds(str(track.get("duration") or "")))
-        if album_entry.callback_data == "liked":
+        cached = self.metadata_store.get_track(video_id) if self.metadata_store else None
+        if cached and cached.effective_amarok_rating() > 0:
+            ET.SubElement(el, "rating").text = str(max(1, round(cached.effective_amarok_rating() / 2.0)))
+        elif album_entry.callback_data == "liked":
             ET.SubElement(el, "rating").text = "5"
         ET.SubElement(el, "url").text = str(track.get("playableUrl") or "")
-        ET.SubElement(el, "art").text = str(track.get("coverUrl") or album_entry.cover_url or "")
+        art_url = str(track.get("coverUrl") or album_entry.cover_url or "")
+        if cached and cached.cover_local_path:
+            art_url = f"{self.auth.get_settings().base_url}/cover/{video_id}"
+        ET.SubElement(el, "art").text = art_url
 
     def _handle_artists(self, filter_val: str) -> str:
         root = ET.Element("root")

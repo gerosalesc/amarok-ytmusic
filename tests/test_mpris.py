@@ -8,11 +8,13 @@ from unittest.mock import MagicMock
 
 from amarok_ytmusic.auth import AuthManager
 from amarok_ytmusic.config import SettingsStore
+from amarok_ytmusic.metadata_store import MetadataStore
 from amarok_ytmusic.mpris_monitor import (
     MPRISMonitor,
     NowPlayingState,
     extract_video_id_from_comment,
     extract_video_id_from_url,
+    parse_amarok_dbus_datetime,
     rating_float_to_like_status,
 )
 from amarok_ytmusic.ytmusic_client import YTMusicCatalogClient
@@ -88,3 +90,59 @@ async def test_mpris_monitor_scrobbles_and_syncs_rating(tmp_path: Path) -> None:
     await asyncio.sleep(0.02)
     assert catalog.report_playback_history.call_count == 1
     assert catalog.rate_track.call_count == 1
+
+
+async def test_mpris_merges_local_collection_stats_and_refines_score(tmp_path: Path) -> None:
+    store = SettingsStore(config_dir=tmp_path / "cfg")
+    auth = AuthManager(store)
+    auth.is_authenticated = MagicMock(return_value=False)
+    catalog = YTMusicCatalogClient(auth)
+    meta_store = MetadataStore(tmp_path / "metadata_cache.db")
+
+    monitor = MPRISMonitor(catalog, auth, metadata_store=meta_store)
+    # Simulate Amarok Local Collection returning existing local play history for an Ampache track
+    monitor.query_local_collection_stats_sync = MagicMock(
+        return_value={
+            "play_count": 3,
+            "score": 82.0,
+            "user_rating": 8,
+            "first_played": 1700000000.0,
+            "last_played": 1795000000.0,
+            "local_url": "/home/user/Music/YouTube Music/Artist/Album/Track.m4a",
+        }
+    )
+
+    # Parse Qt D-Bus QDateTime tuples cleanly
+    assert parse_amarok_dbus_datetime(((0, 0, 0), (-1, -1, -1, -1), 0)) == 0.0
+    assert parse_amarok_dbus_datetime(((2026, 11, 20), (12, 30, 0, 0), 1)) > 1795000000.0
+
+    # 1. Track starts playing from Ampache: local collection stats appear immediately
+    snap_start = NowPlayingState(
+        amarok_running=True,
+        is_ytmusic=True,
+        playback_status="Playing",
+        video_id="RJRl5zKyEls",
+        title="Great Days Full Theme — Josephine cherry joestar",
+        artist="★ YouTube Music — My Library",
+        album="Liked Music",
+        url="http://127.0.0.1:18732/stream/RJRl5zKyEls",
+        position_sec=2.0,
+        duration_sec=240.0,
+        user_rating=0.0,
+    )
+    await monitor._process_snapshot(snap_start)
+    assert monitor.state.source == "ampache"
+    assert monitor.state.play_count == 3
+    assert monitor.state.score == 82.0
+    assert monitor.state.amarok_rating == 8
+    assert monitor.state.last_played_display != "Never"
+
+    # 2. Listening past 15s increments play_count to 4, then progressing to 95% refines score upward
+    snap_mid = NowPlayingState(**{**snap_start.__dict__, "position_sec": 20.0})
+    await monitor._process_snapshot(snap_mid)
+    assert monitor.state.play_count == 4
+
+    snap_end = NowPlayingState(**{**snap_start.__dict__, "position_sec": 228.0})
+    await monitor._process_snapshot(snap_end)
+    assert monitor.state.play_count == 4
+    assert monitor.state.score > 82.0
