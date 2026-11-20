@@ -137,7 +137,9 @@ flatpak run org.kde.amarok
    - **`★ YouTube Music — My Library`** → *Liked Music*, *Library Songs*, *Quick Picks & Home*
    - **`♫ YouTube Music — My Playlists`** → All your personal playlists
    - **`◎ YouTube Music — Saved Albums`** → Albums saved in your library
-3. Or type any artist/song into the **Enter search terms here** filter box at the top of the pane to search YouTube Music live.
+3. Or type any artist/song into the **Enter search terms here** filter box at the top of the pane to search YouTube Music live:
+   - Returns **real matching Artists** (expand any artist to browse their **★ Top Songs**, complete **Albums** with release years, and **Singles & EPs**) alongside **`★ Search: <query>`** (**★ Top Songs**, **★ Videos & Live**, matching Albums, and matching Playlists).
+   - **Multi-word search tip:** Amarok 3.3.3's built-in `AmpacheServiceQueryMaker::addFilter()` has an upstream bug where unquoted spaces overwrite earlier words (so `gustavo cerati` only sends `cerati`). Wrap multi-word queries in quotes (**`"gustavo cerati"`**) or join terms with `+` / `_` (**`gustavo+cerati`** / **`gustavo_cerati`**) to send all search terms cleanly.
 4. Double-click or drag tracks to the right-hand playlist queue to play!
 
 ---
@@ -199,7 +201,7 @@ amarok-ytmusic/
 │   ├── track_importer.py           # On-play metadata fetcher & Amarok FMPS-tagged M4A importer
 │   ├── ytmusic_client.py           # ytmusicapi catalog client with rating, history & lyrics
 │   └── web/index.html              # Single-file dark-mode Web Auth, Now-Playing & Cache UI
-├── tests/                          # Pytest unit & integration test suite (31 tests)
+├── tests/                          # Pytest unit & integration test suite (32 tests)
 ├── install.sh                      # Automated installer (uv + Amarok config + systemd user service)
 └── pyproject.toml                  # Package metadata and dependencies
 ```

@@ -8,7 +8,11 @@ from unittest.mock import MagicMock
 
 from fastapi.testclient import TestClient
 
-from amarok_ytmusic.ampache_bridge import AmpacheBridge, parse_duration_seconds
+from amarok_ytmusic.ampache_bridge import (
+    AmpacheBridge,
+    normalize_search_query,
+    parse_duration_seconds,
+)
 from amarok_ytmusic.auth import AuthManager
 from amarok_ytmusic.config import SettingsStore
 from amarok_ytmusic.server import create_app
@@ -49,6 +53,7 @@ def test_ampache_ping_handshake_and_browse(tmp_path: Path) -> None:
             ]
         )
     )
+    app.state.catalog.search_artists = MagicMock(return_value=[])
     app.state.catalog.get_tracks_for_folder = MagicMock(
         return_value=[
             {
@@ -180,3 +185,79 @@ def test_ampache_bridge_persists_state_across_restarts(tmp_path: Path) -> None:
     assert bridge2.get_video_id_for_song_id(song_id) == "vid_persist_1"
     xml_songs_after = bridge2.handle_action("album_songs", filter_val=str(alb_id))
     assert int(ET.fromstring(xml_songs_after).find("song").attrib["id"]) == song_id
+
+
+def test_ampache_search_by_artist_and_query_normalization(tmp_path: Path) -> None:
+    assert normalize_search_query('"gustavo cerati"') == "gustavo cerati"
+    assert normalize_search_query("gustavo+cerati") == "gustavo cerati"
+    assert normalize_search_query("gustavo_cerati") == "gustavo cerati"
+    assert normalize_search_query("+ bien") == "+ bien"
+
+    store = SettingsStore(config_dir=tmp_path / "cfg")
+    app = create_app(store=store, ipc_dir=tmp_path / "ipc", enable_ipc=False, enable_mpris=False)
+    app.state.auth.is_authenticated = MagicMock(return_value=True)
+    app.state.catalog.search_artists = MagicMock(
+        return_value=[
+            {"browseId": "UC_CERATI", "name": "Gustavo Cerati", "coverUrl": "https://img.example/cerati.jpg"},
+            {"browseId": "UC_SODA", "name": "Soda Stereo", "coverUrl": "https://img.example/soda.jpg"},
+        ]
+    )
+    app.state.catalog.get_artist_sections = MagicMock(
+        return_value=[
+            {
+                "level": 1,
+                "itemName": "★ Top Songs",
+                "callbackData": "playlist:OLAK_TOP",
+                "coverUrl": "https://img.example/cerati.jpg",
+                "year": 0,
+            },
+            {
+                "level": 1,
+                "itemName": "Bocanada",
+                "callbackData": "album:MPREb_BOC",
+                "coverUrl": "https://img.example/bocanada.jpg",
+                "year": 1999,
+            },
+        ]
+    )
+    app.state.catalog.get_tracks_for_folder = MagicMock(
+        return_value=[
+            {
+                "level": 0,
+                "videoId": "4F-5KEN3Ljg",
+                "itemName": "Puente",
+                "artist": "Gustavo Cerati",
+                "album": "Bocanada",
+                "playableUrl": "http://127.0.0.1:18732/stream/4F-5KEN3Ljg",
+                "coverUrl": "https://img.example/bocanada.jpg",
+                "duration": "4:34",
+                "year": 1999,
+            }
+        ]
+    )
+
+    with TestClient(app) as client:
+        # Multi-word search using '+' separator normalizes cleanly and returns both Search bucket and real Artists
+        r_art = client.get("/ampache/server/xml.server.php", params={"action": "artists", "filter": "gustavo+cerati"})
+        assert r_art.status_code == 200
+        artists = ET.fromstring(r_art.text).findall("artist")
+        names = [a.findtext("name") for a in artists]
+        assert names == ["★ Search: gustavo cerati", "Gustavo Cerati", "Soda Stereo"]
+        app.state.catalog.search_artists.assert_called_once_with("gustavo cerati", limit=8)
+
+        # Expanding Gustavo Cerati returns Top Songs and real Albums with years
+        cerati_id = artists[1].attrib["id"]
+        r_albs = client.get("/ampache/server/xml.server.php", params={"action": "artist_albums", "filter": cerati_id})
+        albs = ET.fromstring(r_albs.text).findall("album")
+        assert [(a.findtext("name"), a.findtext("year")) for a in albs] == [
+            ("★ Top Songs", "0"),
+            ("Bocanada", "1999"),
+        ]
+
+        # Expanding Bocanada returns clean track title without redundant artist suffix
+        boc_id = albs[1].attrib["id"]
+        r_songs = client.get("/ampache/server/xml.server.php", params={"action": "album_songs", "filter": boc_id})
+        songs = ET.fromstring(r_songs.text).findall("song")
+        assert len(songs) == 1
+        assert songs[0].findtext("title") == "Puente"
+        assert songs[0].findtext("artist") == "Gustavo Cerati"

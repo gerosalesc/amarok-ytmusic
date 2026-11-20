@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass
@@ -27,6 +28,22 @@ ARTIST_MY_LIBRARY = 1
 ARTIST_MY_PLAYLISTS = 2
 ARTIST_SAVED_ALBUMS = 3
 ARTIST_IMPORTED_BASE = 40000
+ARTIST_YT_SEARCH_BASE = 800000
+
+
+def normalize_search_query(raw: str) -> str:
+    """Clean search filter strings sent by Amarok's Ampache query maker.
+
+    Amarok's AmpacheServiceQueryMaker::addFilter() has an upstream bug where unquoted spaces
+    overwrite earlier words. Users can wrap multi-word queries in quotes ("gustavo cerati")
+    or join terms with '+' or '_' (gustavo+cerati / gustavo_cerati), which we normalize cleanly.
+    """
+    q = (raw or "").strip()
+    if len(q) >= 2 and ((q[0] == '"' and q[-1] == '"') or (q[0] == "'" and q[-1] == "'")):
+        q = q[1:-1].strip()
+    # Convert intra-word '+' or '_' separators to spaces without mangling leading '+ bien'
+    q = re.sub(r"(?<=\S)[+_]+(?=\S)", " ", q)
+    return " ".join(q.split())
 
 
 @dataclass
@@ -82,6 +99,10 @@ class AmpacheBridge:
         self._search_artist_by_query: dict[str, int] = {}
         self._search_query_by_artist: dict[int, str] = {}
 
+        self._next_yt_artist_id = ARTIST_YT_SEARCH_BASE + 1
+        self._yt_artist_id_by_browse_id: dict[str, int] = {}
+        self._yt_artist_info_by_id: dict[int, tuple[str, str]] = {}
+
         self._next_cached_artist_id = ARTIST_IMPORTED_BASE
         self._cached_artist_id_by_name: dict[str, int] = {}
         self._cached_artist_name_by_id: dict[int, str] = {}
@@ -114,6 +135,15 @@ class AmpacheBridge:
             raw = json.loads(self.state_path.read_text(encoding="utf-8"))
             self._next_album_id = max(1000, int(raw.get("next_album_id", 1000)))
             self._next_song_id = max(50000, int(raw.get("next_song_id", 50000)))
+            self._next_yt_artist_id = max(
+                ARTIST_YT_SEARCH_BASE + 1, int(raw.get("next_yt_artist_id", ARTIST_YT_SEARCH_BASE + 1))
+            )
+            for aid_s, info in raw.get("yt_artists", {}).items():
+                if isinstance(info, list) and len(info) == 2:
+                    aid = int(aid_s)
+                    bid, name = str(info[0]), str(info[1])
+                    self._yt_artist_id_by_browse_id[bid] = aid
+                    self._yt_artist_info_by_id[aid] = (bid, name)
             for item in raw.get("albums", []):
                 entry = AlbumEntry(
                     album_id=int(item["album_id"]),
@@ -124,7 +154,7 @@ class AmpacheBridge:
                     cover_url=str(item.get("cover_url", "")),
                     year=int(item.get("year", 0)),
                 )
-                self._album_id_by_key[entry.callback_data] = entry.album_id
+                self._album_id_by_key[f"{entry.artist_id}:{entry.callback_data}"] = entry.album_id
                 self._albums_by_id[entry.album_id] = entry
             for k_str, sid_val in raw.get("songs", {}).items():
                 if ":" in k_str:
@@ -141,7 +171,7 @@ class AmpacheBridge:
             return
         try:
             with self._lock:
-                # Persist non-search albums (playlist/library albums) and recent songs
+                # Persist non-search albums (playlist/library albums) and recent songs & YT artists
                 albums_payload = [
                     asdict(e)
                     for e in self._albums_by_id.values()
@@ -149,9 +179,13 @@ class AmpacheBridge:
                 ]
                 songs_items = list(self._song_id_by_key.items())[-3000:]
                 songs_payload = {f"{alb_id}:{vid}": sid for (alb_id, vid), sid in songs_items}
+                yt_artists_items = list(self._yt_artist_info_by_id.items())[-500:]
+                yt_artists_payload = {str(aid): [bid, name] for aid, (bid, name) in yt_artists_items}
                 payload = {
                     "next_album_id": self._next_album_id,
                     "next_song_id": self._next_song_id,
+                    "next_yt_artist_id": self._next_yt_artist_id,
+                    "yt_artists": yt_artists_payload,
                     "albums": albums_payload,
                     "songs": songs_payload,
                 }
@@ -194,12 +228,13 @@ class AmpacheBridge:
         cover_url: str = "",
         year: int = 0,
     ) -> AlbumEntry:
+        key = f"{artist_id}:{callback_data}"
         with self._lock:
-            existing_id = self._album_id_by_key.get(callback_data)
+            existing_id = self._album_id_by_key.get(key)
             if existing_id is None:
                 self._next_album_id += 1
                 existing_id = self._next_album_id
-                self._album_id_by_key[callback_data] = existing_id
+                self._album_id_by_key[key] = existing_id
             entry = AlbumEntry(
                 album_id=existing_id,
                 artist_id=artist_id,
@@ -213,7 +248,7 @@ class AmpacheBridge:
             return entry
 
     def _get_or_create_search_artist(self, query: str) -> tuple[int, str]:
-        norm = query.strip()
+        norm = normalize_search_query(query)
         key = norm.lower()
         with self._lock:
             aid = self._search_artist_by_query.get(key)
@@ -222,7 +257,19 @@ class AmpacheBridge:
                 self._next_search_artist_id += 1
                 self._search_artist_by_query[key] = aid
                 self._search_query_by_artist[aid] = norm
-            return aid, f"Search: {norm}"
+            return aid, f"★ Search: {norm}"
+
+    def _get_or_create_yt_artist(self, browse_id: str, artist_name: str) -> int:
+        bid = browse_id.strip()
+        name = artist_name.strip()
+        with self._lock:
+            aid = self._yt_artist_id_by_browse_id.get(bid)
+            if aid is None:
+                aid = self._next_yt_artist_id
+                self._next_yt_artist_id += 1
+                self._yt_artist_id_by_browse_id[bid] = aid
+            self._yt_artist_info_by_id[aid] = (bid, name)
+            return aid
 
     def _get_or_create_cached_artist(self, artist_name: str) -> int:
         key = artist_name.strip().lower()
@@ -267,7 +314,10 @@ class AmpacheBridge:
             if action == "handshake":
                 return self._handle_handshake()
             if action == "artists":
-                return self._handle_artists(filter_val)
+                res = self._handle_artists(filter_val)
+                if filter_val:
+                    self._save_state()
+                return res
             if action == "artist_albums":
                 res = self._handle_artist_albums(filter_val, limit=limit)
                 self._save_state()
@@ -351,8 +401,14 @@ class AmpacheBridge:
         song_id = self._get_song_id(album_entry.album_id, video_id)
         title = str(track.get("itemName") or "Untitled Track")
         artist_str = str(track.get("artist") or "").strip()
-        # Show the actual track artist in the title since Ampache binds the song's artist node to the parent category
-        display_title = f"{title} — {artist_str}" if artist_str and artist_str != "Unknown Artist" else title
+        # Show the actual track artist in the title when the parent Ampache artist is a virtual bucket
+        # (omit redundant suffix when already browsing inside that exact artist node)
+        same_as_parent = artist_str.lower() == album_entry.artist_name.strip().lower()
+        display_title = (
+            f"{title} — {artist_str}"
+            if artist_str and artist_str != "Unknown Artist" and not same_as_parent
+            else title
+        )
 
         el = ET.SubElement(root, "song", {"id": str(song_id)})
         ET.SubElement(el, "title").text = display_title
@@ -375,9 +431,32 @@ class AmpacheBridge:
 
     def _handle_artists(self, filter_val: str) -> str:
         root = ET.Element("root")
-        if filter_val:
-            aid, label = self._get_or_create_search_artist(filter_val)
+        query = normalize_search_query(filter_val)
+        if query:
+            # 1. Unified search bucket (Top Songs, Videos, matching Albums & Playlists)
+            aid, label = self._get_or_create_search_artist(query)
             self._append_artist(root, aid, label)
+
+            # 2. Real YouTube Music artists matching the search query (expandable into Top Songs, Albums & Singles)
+            seen_names: set[str] = set()
+            for artist in self.catalog.search_artists(query, limit=8):
+                bid = str(artist.get("browseId") or "").strip()
+                name = str(artist.get("name") or "").strip()
+                if not bid or not name:
+                    continue
+                yt_aid = self._get_or_create_yt_artist(bid, name)
+                self._append_artist(root, yt_aid, name)
+                seen_names.add(name.lower())
+
+            # 3. Any matching cached/local artists not already returned by YouTube Music search
+            if self.metadata_store:
+                q_low = query.lower()
+                for artist_name in self.metadata_store.list_cached_artists():
+                    if q_low in artist_name.lower() and artist_name.lower() not in seen_names:
+                        cached_aid = self._get_or_create_cached_artist(artist_name)
+                        self._append_artist(root, cached_aid, artist_name)
+                        seen_names.add(artist_name.lower())
+
             return _xml_response(root)
 
         if not self.auth.is_authenticated():
@@ -489,7 +568,30 @@ class AmpacheBridge:
                 )
             return entries
 
-        # Dynamic search artist
+        # Real YouTube Music artist discovered via search (Top Songs + full Albums + Singles)
+        with self._lock:
+            yt_artist = self._yt_artist_info_by_id.get(artist_id)
+        if yt_artist:
+            browse_id, artist_name = yt_artist
+            sections = self.catalog.get_artist_sections(browse_id, artist_name)
+            entries = []
+            for f in sections:
+                cb = str(f.get("callbackData") or "")
+                if not cb or cb.startswith("info:"):
+                    continue
+                entries.append(
+                    self._register_dynamic_album(
+                        artist_id,
+                        artist_name,
+                        str(f.get("itemName") or "Results"),
+                        cb,
+                        cover_url=str(f.get("coverUrl") or ""),
+                        year=int(f.get("year") or 0),
+                    )
+                )
+            return entries
+
+        # Dynamic search artist (Songs + Videos + matching Albums & Playlists)
         query = self._search_query_by_artist.get(artist_id)
         if query:
             folders = self.catalog.get_root_folders(query)
@@ -501,10 +603,11 @@ class AmpacheBridge:
                 entries.append(
                     self._register_dynamic_album(
                         artist_id,
-                        f"Search: {query}",
+                        f"★ Search: {query}",
                         str(f.get("itemName") or "Results"),
                         cb,
                         cover_url=str(f.get("coverUrl") or ""),
+                        year=int(f.get("year") or 0),
                     )
                 )
             return entries
@@ -528,8 +631,9 @@ class AmpacheBridge:
     def _handle_albums(self, filter_val: str, limit: int = 0) -> str:
         root = ET.Element("root")
         entries: list[AlbumEntry] = []
-        if filter_val:
-            aid, _ = self._get_or_create_search_artist(filter_val)
+        query = normalize_search_query(filter_val)
+        if query:
+            aid, _ = self._get_or_create_search_artist(query)
             entries = self._albums_for_artist(aid)
         else:
             for aid in (ARTIST_MY_LIBRARY, ARTIST_MY_PLAYLISTS, ARTIST_SAVED_ALBUMS):
@@ -602,9 +706,10 @@ class AmpacheBridge:
 
     def _handle_songs(self, filter_val: str, limit: int = 0) -> str:
         root = ET.Element("root")
-        if filter_val:
-            aid, label = self._get_or_create_search_artist(filter_val)
-            entry = self._register_dynamic_album(aid, label, f"Songs: {filter_val}", f"search_songs:{filter_val}")
+        query = normalize_search_query(filter_val)
+        if query:
+            aid, label = self._get_or_create_search_artist(query)
+            entry = self._register_dynamic_album(aid, label, f"★ Top Songs: {query}", f"search_songs:{query}")
             tracks = self.catalog.get_tracks_for_folder(entry.callback_data)
             if limit > 0:
                 tracks = tracks[:limit]

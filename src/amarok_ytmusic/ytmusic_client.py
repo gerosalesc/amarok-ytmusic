@@ -22,6 +22,7 @@ class CatalogFolder:
     callback_data: str
     info_html: str = ""
     cover_url: str = ""
+    year: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -30,6 +31,7 @@ class CatalogFolder:
             "callbackData": self.callback_data,
             "infoHtml": self.info_html,
             "coverUrl": self.cover_url,
+            "year": self.year,
         }
 
 
@@ -298,8 +300,144 @@ class YTMusicCatalogClient:
         result = [f.to_dict() for f in folders]
         return self._set_cached(cache_key, result)
 
+    def search_artists(self, query: str, limit: int = 8) -> list[dict[str, Any]]:
+        """Search YouTube Music for matching artists (with browseId and thumbnail)."""
+        query = query.strip()
+        if not query:
+            return []
+        cache_key = f"search_artists:{query.lower()}:{limit}"
+        cached = self._get_cached(cache_key)
+        if cached is not None:
+            return cached
+
+        yt = self.auth.create_ytmusic()
+        artists: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        try:
+            raw = yt.search(query, filter="artists", limit=limit) or []
+            for item in raw:
+                browse_id = str(item.get("browseId") or "").strip()
+                name = str(item.get("artist") or item.get("name") or "").strip()
+                if not browse_id or not name or browse_id in seen:
+                    continue
+                seen.add(browse_id)
+                artists.append(
+                    {
+                        "browseId": browse_id,
+                        "name": name,
+                        "subscribers": str(item.get("subscribers") or ""),
+                        "coverUrl": _best_thumbnail(item),
+                    }
+                )
+        except Exception as exc:
+            log.warning("Artist search failed for %r: %s", query, exc)
+
+        return self._set_cached(cache_key, artists)
+
+    def get_artist_sections(self, browse_id: str, artist_name: str = "") -> list[dict[str, Any]]:
+        """Return expandable sections for a YouTube Music artist: Top Songs, full Albums, and Singles."""
+        browse_id = browse_id.strip()
+        if not browse_id:
+            return []
+        cache_key = f"artist_sections:{browse_id}"
+        cached = self._get_cached(cache_key)
+        if cached is not None:
+            return cached
+
+        yt = self.auth.create_ytmusic()
+        try:
+            detail = yt.get_artist(browse_id) or {}
+        except Exception as exc:
+            log.warning("get_artist failed for %s: %s", browse_id, exc)
+            return []
+
+        resolved_name = str(detail.get("name") or artist_name or "Artist").strip()
+        artist_cover = _best_thumbnail(detail)
+        folders: list[CatalogFolder] = []
+
+        # 1. Top Songs (full YouTube Music Top Songs playlist when browseId is present)
+        songs_sec = detail.get("songs") or {}
+        songs_bid = str(songs_sec.get("browseId") or "").strip()
+        if songs_bid:
+            pl_id = songs_bid[2:] if songs_bid.startswith("VL") else songs_bid
+            folders.append(
+                CatalogFolder(
+                    name="★ Top Songs",
+                    callback_data=f"playlist:{pl_id}",
+                    cover_url=artist_cover,
+                    year=0,
+                    info_html=_folder_info_html(f"Top Songs — {resolved_name}", "Most popular tracks on YouTube Music.", artist_cover),
+                )
+            )
+        elif songs_sec.get("results"):
+            folders.append(
+                CatalogFolder(
+                    name="★ Top Songs",
+                    callback_data=f"artist_top:{browse_id}",
+                    cover_url=artist_cover,
+                    year=0,
+                    info_html=_folder_info_html(f"Top Songs — {resolved_name}", "Most popular tracks on YouTube Music.", artist_cover),
+                )
+            )
+
+        seen_albums: set[str] = set()
+
+        # 2. Full Albums discography (fetch complete list via get_artist_albums when available)
+        alb_sec = detail.get("albums") or {}
+        raw_albums: list[dict[str, Any]] = []
+        if alb_sec.get("browseId") and alb_sec.get("params"):
+            try:
+                raw_albums = yt.get_artist_albums(
+                    str(alb_sec["browseId"]), str(alb_sec["params"]), limit=25
+                ) or []
+            except Exception as exc:
+                log.debug("get_artist_albums fallback for %s: %s", browse_id, exc)
+        if not raw_albums:
+            raw_albums = list(alb_sec.get("results") or [])
+
+        for alb in raw_albums:
+            alb_bid = str(alb.get("browseId") or "").strip()
+            title = str(alb.get("title") or "").strip()
+            if not alb_bid or not title or alb_bid in seen_albums:
+                continue
+            seen_albums.add(alb_bid)
+            cover = _best_thumbnail(alb) or artist_cover
+            year = _safe_year(alb.get("year"))
+            folders.append(
+                CatalogFolder(
+                    name=title,
+                    callback_data=f"album:{alb_bid}",
+                    cover_url=cover,
+                    year=year,
+                    info_html=_folder_info_html(title, f"Album by {resolved_name}", cover),
+                )
+            )
+
+        # 3. Singles & EPs
+        singles_sec = detail.get("singles") or {}
+        for item in (singles_sec.get("results") or [])[:15]:
+            s_bid = str(item.get("browseId") or "").strip()
+            title = str(item.get("title") or "").strip()
+            if not s_bid or not title or s_bid in seen_albums:
+                continue
+            seen_albums.add(s_bid)
+            cover = _best_thumbnail(item) or artist_cover
+            year = _safe_year(item.get("year"))
+            folders.append(
+                CatalogFolder(
+                    name=f"Single: {title}",
+                    callback_data=f"album:{s_bid}",
+                    cover_url=cover,
+                    year=year,
+                    info_html=_folder_info_html(title, f"Single / EP by {resolved_name}", cover),
+                )
+            )
+
+        result = [f.to_dict() for f in folders]
+        return self._set_cached(cache_key, result)
+
     def _search_folders(self, query: str) -> list[dict[str, Any]]:
-        """Return search result groups (Songs + top matching Albums & Playlists)."""
+        """Return search result groups (Top Songs + Videos + matching Albums & Playlists)."""
         cache_key = f"search_folders:{query.lower()}"
         cached = self._get_cached(cache_key)
         if cached is not None:
@@ -308,20 +446,22 @@ class YTMusicCatalogClient:
         yt = self.auth.create_ytmusic()
         folders: list[CatalogFolder] = [
             CatalogFolder(
-                name=f"Songs matching '{query}'",
+                name=f"★ Top Songs: {query}",
                 callback_data=f"search_songs:{query}",
+                year=0,
                 info_html=_folder_info_html(f"Songs: {query}", "Top YouTube Music song results."),
             ),
             CatalogFolder(
-                name=f"Videos & Live matching '{query}'",
+                name=f"★ Videos & Live: {query}",
                 callback_data=f"search_videos:{query}",
+                year=0,
                 info_html=_folder_info_html(f"Videos: {query}", "Top YouTube Music video & live performance results."),
             ),
         ]
 
         # Also surface top matching albums and playlists directly as expandable folders!
         try:
-            albums = yt.search(query, filter="albums", limit=6) or []
+            albums = yt.search(query, filter="albums", limit=8) or []
             for alb in albums:
                 browse_id = alb.get("browseId")
                 title = str(alb.get("title") or "").strip()
@@ -329,11 +469,13 @@ class YTMusicCatalogClient:
                     continue
                 artist = _join_artists(alb.get("artists"))
                 cover = _best_thumbnail(alb)
+                year = _safe_year(alb.get("year"))
                 folders.append(
                     CatalogFolder(
                         name=f"Album: {title} — {artist}",
                         callback_data=f"album:{browse_id}",
                         cover_url=cover,
+                        year=year,
                         info_html=_folder_info_html(title, f"Album by {artist}", cover),
                     )
                 )
@@ -418,6 +560,11 @@ class YTMusicCatalogClient:
                 if not merged.get("year") and album_year:
                     merged["year"] = album_year
                 raw_tracks.append(merged)
+        elif callback_data.startswith("artist_top:"):
+            browse_id = callback_data.split(":", 1)[1]
+            detail = yt.get_artist(browse_id) or {}
+            default_album = f"Top Songs — {detail.get('name') or 'Artist'}"
+            raw_tracks = (detail.get("songs") or {}).get("results") or []
         elif callback_data.startswith("search_songs:"):
             q = callback_data.split(":", 1)[1]
             raw_tracks = yt.search(q, filter="songs", limit=25) or []
