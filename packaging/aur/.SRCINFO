@@ -1,0 +1,29 @@
+pkgbase = amarok-ytmusic
+	pkgdesc = YouTube Music streaming, offline cache & web-auth integration bridge for Amarok 3.3+ (KDE)
+	pkgver = 0.1.1
+	pkgrel = 1
+	url = https://github.com/gerosalesc/amarok-ytmusic
+	install = amarok-ytmusic.install
+	arch = any
+	license = GPL-3.0-or-later
+	makedepends = python-build
+	makedepends = python-installer
+	makedepends = python-hatchling
+	makedepends = python-wheel
+	depends = python>=3.11
+	depends = python-fastapi
+	depends = uvicorn
+	depends = python-httpx
+	depends = python-ytmusicapi
+	depends = yt-dlp
+	depends = python-jeepney
+	depends = python-mutagen
+	optdepends = amarok: native Amarok 3.3+ player (or use Flatpak org.kde.amarok)
+	optdepends = deno: JS runtime for YouTube Music Premium / high-bitrate streams via yt-dlp-ejs
+	optdepends = kwallet: KDE browser cookie extraction
+	source = amarok-ytmusic-0.1.1.tar.gz::https://github.com/gerosalesc/amarok-ytmusic/archive/refs/tags/v0.1.1.tar.gz
+	source = amarok-ytmusic.service
+	sha256sums = SKIP
+	sha256sums = ce552f26cb5e020dd637f17f3a181b5efa32c2cfec6623266fcbd6ed5c7efc04
+
+pkgname = amarok-ytmusic

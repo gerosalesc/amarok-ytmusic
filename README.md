@@ -92,7 +92,32 @@ flowchart LR
 
 ## Quick Installation
 
-Clone the repository and run the installer script:
+### Option 1: PyPI via `uv` or `pipx` (Recommended — Any Linux Distro)
+
+```bash
+# With uv
+uv tool install amarok-ytmusic
+amarok-ytmusic setup
+
+# Or with pipx
+pipx install amarok-ytmusic
+amarok-ytmusic setup
+```
+
+To upgrade later (including pulling the latest `yt-dlp`):
+```bash
+uv tool upgrade amarok-ytmusic && amarok-ytmusic setup
+```
+
+### Option 2: Arch Linux / AUR
+
+```bash
+yay -S amarok-ytmusic   # or: paru -S amarok-ytmusic
+amarok-ytmusic setup --no-service
+systemctl --user enable --now amarok-ytmusic.service
+```
+
+### Option 3: From Source
 
 ```bash
 git clone https://github.com/gerosalesc/amarok-ytmusic.git
@@ -101,12 +126,15 @@ chmod +x install.sh
 ./install.sh
 ```
 
-What `./install.sh` does:
-1. Installs Python dependencies into `.venv` using `uv sync`.
-2. Enables `amarok_service_ampache` and adds the **`YouTube Music`** server (`http://127.0.0.1:18732/ampache`) to `~/.var/app/org.kde.amarok/config/amarokrc` (and `~/.config/amarokrc` if present).
-3. Installs the Amarok script files to `~/.var/app/org.kde.amarok/data/amarok/scripts/youtube_music/`.
-4. Symlinks `~/.local/bin/amarok-ytmusic`.
-5. Installs, enables, and starts the **`amarok-ytmusic.service`** background daemon via `systemd --user`.
+What `amarok-ytmusic setup` (and `./install.sh`) does:
+1. Enables `amarok_service_ampache` and adds the **`YouTube Music`** server (`http://127.0.0.1:18732/ampache`) to `~/.var/app/org.kde.amarok/config/amarokrc` and/or `~/.config/amarokrc`.
+2. Installs the enhanced Amarok Context Applets (**Current Track** + **Lyrics**) and `ScriptableService` files.
+3. Installs, enables, and starts the **`amarok-ytmusic.service`** background daemon via `systemd --user` (unless `--no-service` is passed).
+
+To remove the Amarok integration and systemd service later (preserving your offline music cache and config):
+```bash
+amarok-ytmusic uninstall
+```
 
 ---
 
@@ -169,6 +197,12 @@ amarok-ytmusic cache --set-dir ~/Music/YTMusicCache --move --limit-mb 0
 amarok-ytmusic cache --scan
 amarok-ytmusic cache --sync-missing
 
+# Configure Amarok (Ampache, Context Applets, Script) and systemd --user service
+amarok-ytmusic setup [--no-service] [--host 127.0.0.1] [--port 18732]
+
+# Remove Amarok integration and systemd --user service (preserves cache/config)
+amarok-ytmusic uninstall
+
 # Sync cookies directly from a local browser via CLI
 amarok-ytmusic auth --browser chrome [--keyring KWALLET5] [--profile Default] [--authuser 0]
 
@@ -190,13 +224,16 @@ journalctl --user -u amarok-ytmusic.service -f
 
 ```text
 amarok-ytmusic/
+├── .github/workflows/              # CI test matrix + automated PyPI & GitHub Release workflow
 ├── amarok_kpackage/                # KDE KPackage QML overrides (Current Track stats/rating/cover + Lyrics)
 ├── amarok_script/                  # Amarok ScriptableService (main.js, script.json, script.spec)
+├── packaging/aur/                  # Arch Linux AUR PKGBUILD, .SRCINFO, install hooks & systemd unit
 ├── src/amarok_ytmusic/
 │   ├── ampache_bridge.py           # Ampache XML API bridge with persistent ID cache & imported artists
 │   ├── auth.py                     # Browser cookie extraction, raw headers parser, and OAuth
 │   ├── cli.py                      # `amarok-ytmusic` CLI entrypoint
 │   ├── config.py                   # XDG/Flatpak paths and persistent settings store
+│   ├── installer.py                # Cross-distro `setup` / `uninstall` (Amarok config, applets & systemd)
 │   ├── ipc_watcher.py              # Atomic directory/file IPC watcher for ScriptableService
 │   ├── metadata_store.py           # SQLite cache for rich song metadata, user profile & play stats
 │   ├── mpris_monitor.py            # MPRIS2 D-Bus monitor, auto-importer, scrobbler & rating sync
@@ -205,7 +242,7 @@ amarok-ytmusic/
 │   ├── track_importer.py           # On-play metadata fetcher & Amarok FMPS-tagged M4A importer
 │   ├── ytmusic_client.py           # ytmusicapi catalog client with rating, history & lyrics
 │   └── web/index.html              # Single-file dark-mode Web Auth, Now-Playing & Cache UI
-├── tests/                          # Pytest unit & integration test suite (42 tests)
+├── tests/                          # Pytest unit & integration test suite (48 tests)
 ├── install.sh                      # Automated installer (uv + Amarok config + systemd user service)
 └── pyproject.toml                  # Package metadata and dependencies
 ```

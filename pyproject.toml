@@ -1,8 +1,35 @@
 [project]
 name = "amarok-ytmusic"
-version = "0.1.0"
-description = "YouTube Music streaming & web-auth integration plugin for Amarok 3.3+ (KDE)"
+version = "0.1.1"
+description = "YouTube Music streaming, offline cache & web-auth integration bridge for Amarok 3.3+ (KDE)"
 readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [
+    { name = "German Rosales", email = "rosalesgermane@gmail.com" },
+]
+keywords = [
+    "amarok",
+    "kde",
+    "youtube-music",
+    "ytmusic",
+    "ampache",
+    "mpris",
+    "music",
+    "streaming",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Environment :: Web Environment",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Sound/Audio :: Players",
+]
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115.0",
@@ -20,15 +47,37 @@ dev = [
     "pytest-asyncio>=0.24.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/gerosalesc/amarok-ytmusic"
+Repository = "https://github.com/gerosalesc/amarok-ytmusic"
+Issues = "https://github.com/gerosalesc/amarok-ytmusic/issues"
+
 [project.scripts]
 amarok-ytmusic = "amarok_ytmusic.cli:main"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/amarok_ytmusic"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"amarok_kpackage" = "amarok_ytmusic/assets/amarok_kpackage"
+"amarok_script" = "amarok_ytmusic/assets/amarok_script"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+    "/amarok_kpackage",
+    "/amarok_script",
+    "/packaging",
+    "/install.sh",
+    "/README.md",
+    "/LICENSE",
+    "/pyproject.toml",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

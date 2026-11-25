@@ -1,0 +1,15 @@
+[Unit]
+Description=Amarok YouTube Music Web Auth & Streaming Bridge
+After=network-online.target graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/amarok-ytmusic serve --host 127.0.0.1 --port 18732
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=5
+Environment=PYTHONUNBUFFERED=1
+Environment="PATH=%h/.deno/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+[Install]
+WantedBy=default.target

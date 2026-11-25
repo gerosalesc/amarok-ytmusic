@@ -1,0 +1,50 @@
+# Maintainer: German Rosales <rosalesgermane@gmail.com>
+pkgname=amarok-ytmusic
+pkgver=0.1.1
+pkgrel=1
+pkgdesc="YouTube Music streaming, offline cache & web-auth integration bridge for Amarok 3.3+ (KDE)"
+arch=('any')
+url="https://github.com/gerosalesc/amarok-ytmusic"
+license=('GPL-3.0-or-later')
+depends=(
+    'python>=3.11'
+    'python-fastapi'
+    'uvicorn'
+    'python-httpx'
+    'python-ytmusicapi'
+    'yt-dlp'
+    'python-jeepney'
+    'python-mutagen'
+)
+makedepends=(
+    'python-build'
+    'python-installer'
+    'python-hatchling'
+    'python-wheel'
+)
+optdepends=(
+    'amarok: native Amarok 3.3+ player (or use Flatpak org.kde.amarok)'
+    'deno: JS runtime for YouTube Music Premium / high-bitrate streams via yt-dlp-ejs'
+    'kwallet: KDE browser cookie extraction'
+)
+install="${pkgname}.install"
+source=(
+    "${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz"
+    "${pkgname}.service"
+)
+sha256sums=(
+    'SKIP'
+    'ce552f26cb5e020dd637f17f3a181b5efa32c2cfec6623266fcbd6ed5c7efc04'
+)
+
+build() {
+    cd "${pkgname}-${pkgver}"
+    python -m build --wheel --no-isolation
+}
+
+package() {
+    cd "${pkgname}-${pkgver}"
+    python -m installer --destdir="${pkgdir}" dist/*.whl
+    install -Dm644 "${srcdir}/${pkgname}.service" "${pkgdir}/usr/lib/systemd/user/${pkgname}.service"
+    install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

@@ -1,0 +1,26 @@
+post_install() {
+    cat <<'EOF'
+==> amarok-ytmusic installed!
+==> Finish user-level Amarok setup (run as your regular user, not root):
+      amarok-ytmusic setup --no-service
+      systemctl --user enable --now amarok-ytmusic.service
+==> Then open http://127.0.0.1:18732 to sign in to YouTube Music and restart Amarok.
+EOF
+}
+
+post_upgrade() {
+    cat <<'EOF'
+==> amarok-ytmusic upgraded!
+==> Refresh Amarok Context Applets and restart the user service (as your regular user):
+      amarok-ytmusic setup --no-service
+      systemctl --user daemon-reload && systemctl --user restart amarok-ytmusic.service
+EOF
+}
+
+pre_remove() {
+    cat <<'EOF'
+==> Before uninstalling, disable the user service and remove Amarok integration (as your regular user):
+      systemctl --user disable --now amarok-ytmusic.service
+      amarok-ytmusic uninstall
+EOF
+}

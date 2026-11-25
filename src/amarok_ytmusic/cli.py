@@ -14,8 +14,10 @@ from pathlib import Path
 
 import uvicorn
 
+from . import __version__
 from .auth import AuthError, AuthManager, detect_browsers
 from .config import DEFAULT_HOST, DEFAULT_PORT, SettingsStore, configure_ipv4_preference, validate_cache_dir
+from .installer import run_setup, run_uninstall
 from .metadata_store import MetadataStore
 from .mpris_monitor import MPRISMonitor
 from .server import create_app
@@ -349,12 +351,81 @@ def cmd_cache(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_setup(args: argparse.Namespace) -> int:
+    print("==> Configuring Amarok integration for YouTube Music...")
+    res = run_setup(
+        host=args.host,
+        port=args.port,
+        install_service=not args.no_service,
+        exec_cmd=args.exec_cmd,
+    )
+    if res.scripts_installed:
+        for p in res.scripts_installed:
+            print(f"    Installed ScriptableService -> {p}")
+    if res.applets_installed:
+        for p in res.applets_installed:
+            print(f"    Installed Context Applet    -> {p}")
+    elif res.applets_skipped_reason:
+        print(f"    Skipped KPackage applets ({res.applets_skipped_reason})")
+    if res.amarokrc_updated:
+        for p in res.amarokrc_updated:
+            print(f"    Updated Amarok config       -> {p}")
+    else:
+        print("    Amarok Ampache configuration already up to date.")
+    if res.service_file:
+        print(f"    Installed systemd unit      -> {res.service_file}")
+        if res.service_started:
+            print("    systemd --user service enabled and restarted!")
+        elif res.service_note:
+            print(f"    Note: {res.service_note}")
+    elif args.no_service:
+        print("    Skipped user systemd service (--no-service).")
+    for w in res.warnings:
+        print(f"    Warning: {w}", file=sys.stderr)
+
+    print("")
+    print("Done! Next steps:")
+    print(f"  1. Open http://{args.host}:{args.port} in your browser to sign in to YouTube Music.")
+    print("  2. Fully quit Amarok (Amarok -> Quit / Ctrl+Q, not just closing to tray) and relaunch it.")
+    print("  3. Open Media Sources -> Internet -> Ampache (YouTube Music)!")
+    return 0
+
+
+def cmd_uninstall(args: argparse.Namespace) -> int:
+    print("==> Removing Amarok YouTube Music integration...")
+    res = run_uninstall(host=args.host, port=args.port)
+    if res.service_removed:
+        state = "stopped, disabled, and removed" if res.service_stopped else "removed"
+        print(f"    systemd user service {state}: {res.service_removed}")
+    for p in res.scripts_removed:
+        print(f"    Removed ScriptableService: {p}")
+    for p in res.applets_removed:
+        print(f"    Removed Context Applet override: {p}")
+    for p in res.amarokrc_updated:
+        print(f"    Removed Ampache entry from: {p}")
+    print("Done! Your cached music and ~/.config/amarok-ytmusic settings were preserved.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="amarok-ytmusic",
         description="YouTube Music web-auth and streaming bridge for Amarok 3.3+ on KDE",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    p_setup = sub.add_parser("setup", help="Configure Amarok (Ampache, Context Applets, Script) and systemd --user service")
+    p_setup.add_argument("--host", default=DEFAULT_HOST)
+    p_setup.add_argument("--port", type=int, default=DEFAULT_PORT)
+    p_setup.add_argument("--no-service", action="store_true", help="Skip creating/restarting ~/.config/systemd/user/amarok-ytmusic.service")
+    p_setup.add_argument("--exec-cmd", default=None, help=argparse.SUPPRESS)
+    p_setup.set_defaults(func=cmd_setup)
+
+    p_uninstall = sub.add_parser("uninstall", help="Remove Amarok integration files, Ampache config entry, and user systemd service")
+    p_uninstall.add_argument("--host", default=DEFAULT_HOST)
+    p_uninstall.add_argument("--port", type=int, default=DEFAULT_PORT)
+    p_uninstall.set_defaults(func=cmd_uninstall)
 
     p_serve = sub.add_parser("serve", help="Run the local Web Auth, IPC watcher, and streaming proxy daemon")
     p_serve.add_argument("--host", default=DEFAULT_HOST)
