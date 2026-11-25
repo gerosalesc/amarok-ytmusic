@@ -23,7 +23,7 @@ pkgbase = amarok-ytmusic
 	optdepends = kwallet: KDE browser cookie extraction
 	source = amarok-ytmusic-0.1.1.tar.gz::https://github.com/gerosalesc/amarok-ytmusic/archive/refs/tags/v0.1.1.tar.gz
 	source = amarok-ytmusic.service
-	sha256sums = SKIP
+	sha256sums = e9e0622e234ea9d9273fe7580d1de58129522dce587652e51aeff0408b6ab148
 	sha256sums = ce552f26cb5e020dd637f17f3a181b5efa32c2cfec6623266fcbd6ed5c7efc04
 
 pkgname = amarok-ytmusic

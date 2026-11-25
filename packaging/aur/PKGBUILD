@@ -33,7 +33,7 @@ source=(
     "${pkgname}.service"
 )
 sha256sums=(
-    'SKIP'
+    'e9e0622e234ea9d9273fe7580d1de58129522dce587652e51aeff0408b6ab148'
     'ce552f26cb5e020dd637f17f3a181b5efa32c2cfec6623266fcbd6ed5c7efc04'
 )
 
