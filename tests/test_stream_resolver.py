@@ -116,3 +116,42 @@ async def test_stream_resolver_deduplicates_concurrent_requests(
     )
     assert extract_count == 1
     assert r1.url == r2.url == r3.url
+
+
+async def test_stream_resolver_forces_ipv4_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = SettingsStore(config_dir=tmp_path / "cfg")
+    resolver = StreamResolver(AuthManager(store))
+    seen_opts: list[dict[str, Any]] = []
+
+    class FakeYDL:
+        def __init__(self, opts: dict[str, Any]) -> None:
+            seen_opts.append(dict(opts))
+
+        def __enter__(self) -> FakeYDL:
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            pass
+
+        def extract_info(self, url: str, download: bool = False) -> dict[str, Any]:
+            return {
+                "id": "dQw4w9WgXcQ",
+                "title": "Test",
+                "url": "https://googlevideo.example/audio.webm",
+                "ext": "webm",
+                "acodec": "opus",
+            }
+
+    import yt_dlp
+
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", FakeYDL)
+    monkeypatch.delenv("AMAROK_YTMUSIC_ALLOW_IPV6", raising=False)
+
+    await resolver.resolve("dQw4w9WgXcQ")
+    assert seen_opts[-1].get("source_address") == "0.0.0.0"
+
+    monkeypatch.setenv("AMAROK_YTMUSIC_ALLOW_IPV6", "1")
+    await resolver.resolve("dQw4w9WgXcQ", force_refresh=True)
+    assert "source_address" not in seen_opts[-1]

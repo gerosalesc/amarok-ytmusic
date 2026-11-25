@@ -10,7 +10,7 @@
 
 - **Native Amarok Integration (`Ampache (YouTube Music)`)**:
   - Uses Amarok 3.3's compiled C++/KF6 `amarok_service_ampache` plugin—no KF6 C++ compilation required and immune to Amarok 3.3.3's upstream `KPluginMetaData` JS script-loader bug.
-  - Browses **★ My Library** (*Liked Music*, *Library Songs*, *Quick Picks & Home*), **♫ My Playlists**, **◎ Saved Albums**, plus live search via Amarok's filter bar.
+  - Browses **★ My Library** (*Liked Music*, *Library Songs*, *Quick Picks & Home*), **♫ My Playlists**, **◎ Saved Albums**, **⬇ Offline Cache** (*All Offline Songs*, *Offline Liked Songs*, plus offline search fallback), and live search via Amarok's filter bar.
 - **Local Web Authentication Dashboard (`http://127.0.0.1:18732`)**:
   - **1-Click Browser Session Sync**: Sign in at `https://music.youtube.com` in Chrome, Chromium, Firefox, Brave, Vivaldi, or Edge (with full Google 2FA & passkey support) and sync session cookies locally in one click (supports KDE `KWallet 5/6` and `GNOME Keyring`).
   - **Paste Request Headers**: Universal DevTools fallback.
@@ -30,10 +30,11 @@
     - Because Amarok 3.3.3's `AmpacheTrack` returns an empty dummy `Statistics` object, the enhanced **Current Track** applet bridges live local history (`Play Count`, Amarok `Score`, `Last played`), clickable 5-star rating, high-res cover art, and real artist/album names straight from SQLite + Amarok's Local Collection D-Bus (`org.kde.amarok.Collection.Query`)—while leaving non-YouTube local tracks 100% stock.
     - The enhanced **Lyrics** applet displays YouTube Music lyrics directly inside Amarok's built-in Lyrics pane whenever Amarok's built-in lyrics engine is empty.
   - **Persistent Ampache IDs**: Saves assigned album/song IDs in `~/.config/amarok-ytmusic/ampache_state.json` so queued tracks and collection IDs survive daemon restarts.
-  - **Automated On-Play Metadata, User-Stats & Local Collection Import**:
+  - **Offline Song Cache, Automated On-Play Import & Local-First Playback**:
     - Every time a YouTube Music song is played, automatically fetches & caches rich metadata (`title`, `artist`, `album`, `year`, high-res cover art, lyrics, `likeStatus`, `inLibrary`) plus user playback statistics (`play_count`, `score`, `first_played`, `last_played`) in SQLite (`~/.config/amarok-ytmusic/metadata_cache.db`).
     - Caches your user profile info locally so dashboard loads are instant.
-    - Automatically downloads and embeds full MP4 metadata (`©nam`, `©ART`, `©alb`, `©day`, `©lyr`, `covr` cover art, `©cmt=ytmusic:<videoId>`, and Amarok's native `FMPS_Rating`, `FMPS_Playcount`, `FMPS_Rating_Amarok_Score` atoms) into `~/Music/YouTube Music/<Artist>/<Album>/<Title>.m4a`—which Amarok's Local Collection automatically picks up so you get **real Cover Art, real Artist/Album, clickable Stars, Play Count, Score, and Last Played** natively inside Amarok (and instant zero-latency replay on `/stream/<videoId>`!).
+    - Automatically downloads and embeds full MP4 metadata (`©nam`, `©ART`, `©alb`, `©day`, `©lyr`, `covr` cover art, `©cmt=ytmusic:<videoId>`, and Amarok's native `FMPS_Rating`, `FMPS_Playcount`, `FMPS_Rating_Amarok_Score` atoms) into your configurable offline cache folder (default `~/Music/YouTube Music/<Artist>/<Album>/<Title>.m4a`, unlimited retention by default with optional MB cap, folder migration, and folder re-indexing).
+    - **Zero-Latency Offline & Online Replay**: `/stream/<videoId>` checks your local offline cache first and streams directly from disk with full HTTP `Range` seeking and zero-copy on-the-fly MP4 tag masking (`udta` → `free` in the HTTP response only, leaving the tagged `.m4a` on disk untouched) so saved Amarok playlists and Ampache tracks play 100% offline without triggering Amarok's GStreamer 0:00 `MetaStream::Track` bug.
   - **Live Lyrics**: View lyrics for the currently playing Amarok track from the Web UI (`http://127.0.0.1:18732`) or CLI (`amarok-ytmusic lyrics`).
 - **Future-Ready `ScriptableService` Included**:
   - Also ships `amarok_script/` (`main.js`, `script.json`, `script.spec`) and an atomic directory/file IPC watcher (`ipc_watcher.py`) ready for future Amarok 3.x releases once upstream fixes `ScriptManager::loadScript()` to call `KPluginMetaData::fromJsonFile()`.
@@ -162,8 +163,11 @@ amarok-ytmusic lyrics [VIDEO_ID]
 # Import/refresh full metadata, cover art, lyrics & tagged M4A into Amarok Local Collection
 amarok-ytmusic import [VIDEO_ID] [--metadata-only] [--refresh]
 
-# List auto-imported & cached YouTube Music tracks and playback statistics
-amarok-ytmusic cache [--limit 30]
+# Inspect, configure, migrate, or scan the offline song cache folder
+amarok-ytmusic cache [--limit 30] [--offline-only] [--search QUERY]
+amarok-ytmusic cache --set-dir ~/Music/YTMusicCache --move --limit-mb 0
+amarok-ytmusic cache --scan
+amarok-ytmusic cache --sync-missing
 
 # Sync cookies directly from a local browser via CLI
 amarok-ytmusic auth --browser chrome [--keyring KWALLET5] [--profile Default] [--authuser 0]
@@ -201,7 +205,7 @@ amarok-ytmusic/
 │   ├── track_importer.py           # On-play metadata fetcher & Amarok FMPS-tagged M4A importer
 │   ├── ytmusic_client.py           # ytmusicapi catalog client with rating, history & lyrics
 │   └── web/index.html              # Single-file dark-mode Web Auth, Now-Playing & Cache UI
-├── tests/                          # Pytest unit & integration test suite (32 tests)
+├── tests/                          # Pytest unit & integration test suite (42 tests)
 ├── install.sh                      # Automated installer (uv + Amarok config + systemd user service)
 └── pyproject.toml                  # Package metadata and dependencies
 ```

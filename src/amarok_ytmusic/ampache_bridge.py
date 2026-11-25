@@ -27,6 +27,7 @@ log = logging.getLogger("amarok_ytmusic.ampache")
 ARTIST_MY_LIBRARY = 1
 ARTIST_MY_PLAYLISTS = 2
 ARTIST_SAVED_ALBUMS = 3
+ARTIST_OFFLINE_CACHE = 4
 ARTIST_IMPORTED_BASE = 40000
 ARTIST_YT_SEARCH_BASE = 800000
 
@@ -126,6 +127,12 @@ class AmpacheBridge:
         )
         self._register_fixed_album(
             103, ARTIST_MY_LIBRARY, "★ YouTube Music — My Library", "Quick Picks & Home", "home"
+        )
+        self._register_fixed_album(
+            104, ARTIST_OFFLINE_CACHE, "⬇ YouTube Music — Offline Cache", "All Offline Songs", "offline_all"
+        )
+        self._register_fixed_album(
+            105, ARTIST_OFFLINE_CACHE, "⬇ YouTube Music — Offline Cache", "Offline Liked Songs", "offline_liked"
         )
 
     def _load_state(self) -> None:
@@ -459,6 +466,8 @@ class AmpacheBridge:
 
             return _xml_response(root)
 
+        has_offline = bool(self.metadata_store and self.metadata_store.list_offline_tracks(limit=1))
+
         if not self.auth.is_authenticated():
             settings = self.auth.get_settings()
             self._append_artist(
@@ -466,11 +475,19 @@ class AmpacheBridge:
                 ARTIST_MY_LIBRARY,
                 f"Sign in at {settings.base_url} (or type in search bar)",
             )
+            if has_offline:
+                self._append_artist(root, ARTIST_OFFLINE_CACHE, "⬇ YouTube Music — Offline Cache")
+                assert self.metadata_store is not None
+                for artist_name in self.metadata_store.list_cached_artists():
+                    aid = self._get_or_create_cached_artist(artist_name)
+                    self._append_artist(root, aid, artist_name)
             return _xml_response(root)
 
         self._append_artist(root, ARTIST_MY_LIBRARY, "★ YouTube Music — My Library")
         self._append_artist(root, ARTIST_MY_PLAYLISTS, "♫ YouTube Music — My Playlists")
         self._append_artist(root, ARTIST_SAVED_ALBUMS, "◎ YouTube Music — Saved Albums")
+        if has_offline:
+            self._append_artist(root, ARTIST_OFFLINE_CACHE, "⬇ YouTube Music — Offline Cache")
 
         # Also surface real artists from the cached/imported metadata store (with real albums & cover art!)
         if self.metadata_store:
@@ -481,6 +498,27 @@ class AmpacheBridge:
         return _xml_response(root)
 
     def _albums_for_artist(self, artist_id: int) -> list[AlbumEntry]:
+        if artist_id == ARTIST_OFFLINE_CACHE:
+            if not self.metadata_store:
+                return []
+            offline = self.metadata_store.list_offline_tracks(limit=1)
+            if not offline:
+                return []
+            settings = self.auth.get_settings()
+            fallback_cover = (
+                f"{settings.base_url}/cover/{offline[0].video_id}"
+                if offline[0].cover_local_path
+                else offline[0].cover_url
+            )
+            entries = [self._albums_by_id[104]]
+            if self.metadata_store.list_offline_tracks(liked_only=True, limit=1):
+                entries.append(self._albums_by_id[105])
+            if fallback_cover:
+                for e in entries:
+                    if not e.cover_url:
+                        e.cover_url = fallback_cover
+            return entries
+
         if artist_id == ARTIST_MY_LIBRARY:
             if not self.auth.is_authenticated():
                 return []
@@ -591,11 +629,24 @@ class AmpacheBridge:
                 )
             return entries
 
-        # Dynamic search artist (Songs + Videos + matching Albums & Playlists)
+        # Dynamic search artist (Songs + Videos + matching Albums & Playlists + Offline Matches)
         query = self._search_query_by_artist.get(artist_id)
         if query:
-            folders = self.catalog.get_root_folders(query)
             entries = []
+            if self.metadata_store and self.metadata_store.list_tracks(limit=1, query=query, offline_only=True):
+                entries.append(
+                    self._register_dynamic_album(
+                        artist_id,
+                        f"★ Search: {query}",
+                        f"⬇ Offline Matches: {query}",
+                        f"offline_search:{query}",
+                    )
+                )
+            try:
+                folders = self.catalog.get_root_folders(query)
+            except Exception as exc:
+                log.warning("Online search folders failed for %r (offline?): %s", query, exc)
+                folders = []
             for f in folders:
                 cb = str(f.get("callbackData") or "")
                 if not cb or cb.startswith("info:"):
@@ -645,6 +696,65 @@ class AmpacheBridge:
             self._append_album(root, entry)
         return _xml_response(root)
 
+    def _cached_track_to_dict(self, ct: Any, *, include_artist: bool = True) -> dict[str, Any]:
+        settings = self.auth.get_settings()
+        return {
+            "videoId": ct.video_id,
+            "itemName": ct.title or ct.video_id,
+            "artist": ct.artist if include_artist else "",
+            "playableUrl": settings.stream_url(ct.video_id),
+            "duration": f"{ct.duration_sec // 60}:{ct.duration_sec % 60:02d}" if ct.duration_sec else "",
+            "coverUrl": f"{settings.base_url}/cover/{ct.video_id}" if ct.cover_local_path else ct.cover_url,
+        }
+
+    def _tracks_for_album_entry(self, entry: AlbumEntry, limit: int = 0) -> list[dict[str, Any]]:
+        cb = entry.callback_data
+        if cb.startswith("cached_album:") and self.metadata_store:
+            rest = cb.split(":", 1)[1]
+            artist_name, alb_name = rest.split("::", 1) if "::" in rest else (rest, "")
+            cached_tracks = [
+                t
+                for t in self.metadata_store.list_tracks_by_artist(artist_name)
+                if (t.album or "Singles") == alb_name
+            ]
+            if limit > 0:
+                cached_tracks = cached_tracks[:limit]
+            return [self._cached_track_to_dict(ct, include_artist=False) for ct in cached_tracks]
+
+        if cb == "offline_all" and self.metadata_store:
+            tracks_list = self.metadata_store.list_offline_tracks(liked_only=False, limit=limit or 500)
+            return [self._cached_track_to_dict(ct, include_artist=True) for ct in tracks_list]
+
+        if cb == "offline_liked" and self.metadata_store:
+            tracks_list = self.metadata_store.list_offline_tracks(liked_only=True, limit=limit or 500)
+            return [self._cached_track_to_dict(ct, include_artist=True) for ct in tracks_list]
+
+        if cb.startswith("offline_search:") and self.metadata_store:
+            q = cb.split(":", 1)[1]
+            tracks_list = self.metadata_store.list_tracks(limit=limit or 200, query=q, offline_only=True)
+            return [self._cached_track_to_dict(ct, include_artist=True) for ct in tracks_list]
+
+        try:
+            tracks = self.catalog.get_tracks_for_folder(cb)
+        except Exception as exc:
+            log.warning("Online track fetch failed for %s (offline?): %s", cb, exc)
+            tracks = []
+            if self.metadata_store:
+                if cb == "liked":
+                    tracks = [
+                        self._cached_track_to_dict(ct, include_artist=True)
+                        for ct in self.metadata_store.list_offline_tracks(liked_only=True, limit=limit or 500)
+                    ]
+                elif cb.startswith("search_songs:"):
+                    q = cb.split(":", 1)[1]
+                    tracks = [
+                        self._cached_track_to_dict(ct, include_artist=True)
+                        for ct in self.metadata_store.list_tracks(limit=limit or 100, query=q, offline_only=True)
+                    ]
+        if limit > 0:
+            tracks = tracks[:limit]
+        return tracks
+
     def _handle_album_songs(self, filter_val: str, limit: int = 0) -> str:
         root = ET.Element("root")
         try:
@@ -657,30 +767,7 @@ class AmpacheBridge:
         if not entry:
             return _xml_response(root)
 
-        if entry.callback_data.startswith("cached_album:") and self.metadata_store:
-            rest = entry.callback_data.split(":", 1)[1]
-            artist_name, alb_name = rest.split("::", 1) if "::" in rest else (rest, "")
-            settings = self.auth.get_settings()
-            cached_tracks = [
-                t for t in self.metadata_store.list_tracks_by_artist(artist_name) if (t.album or "Singles") == alb_name
-            ]
-            if limit > 0:
-                cached_tracks = cached_tracks[:limit]
-            for idx, ct in enumerate(cached_tracks, start=1):
-                track_dict = {
-                    "videoId": ct.video_id,
-                    "itemName": ct.title,
-                    "artist": "",  # Parent Ampache artist is already the real artist name
-                    "playableUrl": settings.stream_url(ct.video_id),
-                    "duration": f"{ct.duration_sec // 60}:{ct.duration_sec % 60:02d}" if ct.duration_sec else "",
-                    "coverUrl": f"{settings.base_url}/cover/{ct.video_id}" if ct.cover_local_path else ct.cover_url,
-                }
-                self._append_song(root, entry, track_dict, idx)
-            return _xml_response(root)
-
-        tracks = self.catalog.get_tracks_for_folder(entry.callback_data)
-        if limit > 0:
-            tracks = tracks[:limit]
+        tracks = self._tracks_for_album_entry(entry, limit=limit)
         for idx, track in enumerate(tracks, start=1):
             self._append_song(root, entry, track, idx)
         return _xml_response(root)
@@ -696,7 +783,7 @@ class AmpacheBridge:
         count = 0
         # Keep artist-level bulk expansion responsive by capping at the first 3 albums if many exist
         for entry in albums[:3]:
-            tracks = self.catalog.get_tracks_for_folder(entry.callback_data)
+            tracks = self._tracks_for_album_entry(entry)
             for idx, track in enumerate(tracks, start=1):
                 if limit > 0 and count >= limit:
                     return _xml_response(root)
@@ -710,18 +797,24 @@ class AmpacheBridge:
         if query:
             aid, label = self._get_or_create_search_artist(query)
             entry = self._register_dynamic_album(aid, label, f"★ Top Songs: {query}", f"search_songs:{query}")
-            tracks = self.catalog.get_tracks_for_folder(entry.callback_data)
-            if limit > 0:
-                tracks = tracks[:limit]
+            tracks = self._tracks_for_album_entry(entry, limit=limit)
+            if not tracks and self.metadata_store:
+                tracks = [
+                    self._cached_track_to_dict(ct, include_artist=True)
+                    for ct in self.metadata_store.list_tracks(limit=limit or 100, query=query, offline_only=True)
+                ]
             for idx, track in enumerate(tracks, start=1):
                 self._append_song(root, entry, track, idx)
             return _xml_response(root)
 
         if self.auth.is_authenticated():
             entry = self._albums_by_id[101]
-            tracks = self.catalog.get_tracks_for_folder("liked")
-            if limit > 0:
-                tracks = tracks[:limit]
+            tracks = self._tracks_for_album_entry(entry, limit=limit)
+            for idx, track in enumerate(tracks, start=1):
+                self._append_song(root, entry, track, idx)
+        elif self.metadata_store:
+            entry = self._albums_by_id[104]
+            tracks = self._tracks_for_album_entry(entry, limit=limit)
             for idx, track in enumerate(tracks, start=1):
                 self._append_song(root, entry, track, idx)
         return _xml_response(root)

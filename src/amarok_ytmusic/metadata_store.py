@@ -92,7 +92,18 @@ class CachedTrack:
         d["ratingFloat"] = self.amarok_rating_float()
         d["scoreDisplay"] = int(round(self.score))
         d["lastPlayedDisplay"] = format_last_played(self.last_played)
-        d["hasLocalFile"] = bool(self.local_file_path and Path(self.local_file_path).exists())
+        file_size = 0
+        has_local = False
+        if self.local_file_path:
+            try:
+                st = Path(self.local_file_path).stat()
+                if st.st_size > 0:
+                    has_local = True
+                    file_size = st.st_size
+            except OSError:
+                pass
+        d["hasLocalFile"] = has_local
+        d["fileSizeBytes"] = file_size
         return d
 
 
@@ -415,11 +426,91 @@ class MetadataStore:
                 (file_path, video_id),
             )
 
-    def list_tracks(self, limit: int = 200) -> list[CachedTrack]:
+    def find_by_local_file_path(self, file_path: str) -> CachedTrack | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM tracks WHERE local_file_path = ? LIMIT 1",
+                (file_path,),
+            ).fetchone()
+            return self._row_to_track(row) if row else None
+
+    def list_tracks(
+        self,
+        limit: int = 200,
+        query: str = "",
+        offline_only: bool = False,
+    ) -> list[CachedTrack]:
+        q = (query or "").strip()
+        sql = "SELECT * FROM tracks"
+        conditions: list[str] = []
+        params: list[Any] = []
+        if offline_only:
+            conditions.append("local_file_path != ''")
+        if q:
+            like = f"%{q}%"
+            conditions.append("(title LIKE ? OR artist LIKE ? OR album LIKE ? OR video_id LIKE ?)")
+            params.extend([like, like, like, like])
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        sql += " ORDER BY last_played DESC, fetched_at DESC"
+        if not offline_only:
+            sql += " LIMIT ?"
+            params.append(limit)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+            tracks = [self._row_to_track(r) for r in rows]
+        if offline_only:
+            tracks = [t for t in tracks if t.local_file_path and Path(t.local_file_path).is_file()]
+            return tracks[:limit]
+        return tracks
+
+    def list_offline_tracks(self, liked_only: bool = False, limit: int = 500) -> list[CachedTrack]:
+        """Return tracks whose cached audio files currently exist on disk, newest-played first."""
+        sql = "SELECT * FROM tracks WHERE local_file_path != ''"
+        if liked_only:
+            sql += " AND (like_status = 'LIKE' OR user_rating >= 8)"
+        sql += " ORDER BY last_played DESC, fetched_at DESC"
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(sql).fetchall()
+            tracks = [self._row_to_track(r) for r in rows]
+        existing: list[CachedTrack] = []
+        for t in tracks:
+            try:
+                p = Path(t.local_file_path)
+                if p.is_file() and p.stat().st_size > 1000:
+                    existing.append(t)
+                    if len(existing) >= limit:
+                        break
+            except OSError:
+                continue
+        return existing
+
+    def list_missing_audio_tracks(self, limit: int = 500) -> list[CachedTrack]:
+        """Return tracks in the metadata DB that do not currently have a cached audio file on disk."""
         with self._lock, self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM tracks ORDER BY last_played DESC, fetched_at DESC LIMIT ?",
-                (limit,),
+                "SELECT * FROM tracks ORDER BY last_played DESC, fetched_at DESC"
+            ).fetchall()
+            tracks = [self._row_to_track(r) for r in rows]
+        missing: list[CachedTrack] = []
+        for t in tracks:
+            has_valid = False
+            if t.local_file_path:
+                try:
+                    p = Path(t.local_file_path)
+                    has_valid = p.is_file() and p.stat().st_size > 1000
+                except OSError:
+                    has_valid = False
+            if not has_valid:
+                missing.append(t)
+                if len(missing) >= limit:
+                    break
+        return missing
+
+    def list_all_with_local_file(self) -> list[CachedTrack]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM tracks WHERE local_file_path != '' ORDER BY last_played DESC, fetched_at DESC"
             ).fetchall()
             return [self._row_to_track(r) for r in rows]
 
@@ -464,6 +555,32 @@ class MetadataStore:
                 "likedCached": int(row["liked_cached"] or 0),
                 "localFiles": int(row["local_files"] or 0),
             }
+
+    def disk_stats(self) -> dict[str, Any]:
+        """Return metadata stats enriched with real on-disk offline cache file count and byte usage."""
+        summary = self.stats_summary()
+        with self._lock, self._connect() as conn:
+            rows = conn.execute("SELECT local_file_path FROM tracks WHERE local_file_path != ''").fetchall()
+        offline_files = 0
+        total_bytes = 0
+        seen_paths: set[str] = set()
+        for r in rows:
+            fp = str(r["local_file_path"] or "")
+            if not fp or fp in seen_paths:
+                continue
+            seen_paths.add(fp)
+            try:
+                st = Path(fp).stat()
+                if st.st_size > 1000:
+                    offline_files += 1
+                    total_bytes += st.st_size
+            except OSError:
+                continue
+        summary["offlineFiles"] = offline_files
+        summary["missingFiles"] = max(0, summary["totalTracks"] - offline_files)
+        summary["diskUsageBytes"] = total_bytes
+        summary["diskUsageMb"] = round(total_bytes / (1024 * 1024), 2)
+        return summary
 
     def save_user_profile(self, profile: CachedUserProfile) -> None:
         with self._lock, self._connect() as conn:

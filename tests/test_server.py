@@ -54,6 +54,7 @@ def test_stream_proxy_supports_range_and_head(tmp_path: Path, monkeypatch: pytes
     store = SettingsStore(config_dir=tmp_path / "cfg")
     settings = store.load()
     settings.auto_import_metadata = False
+    settings.auto_import_collection = False
     store.save(settings)
     app = create_app(store=store, ipc_dir=tmp_path / "ipc", enable_ipc=False, enable_mpris=False)
 
@@ -128,6 +129,7 @@ def test_stream_proxy_retries_on_upstream_403(tmp_path: Path, monkeypatch: pytes
     store = SettingsStore(config_dir=tmp_path / "cfg")
     settings = store.load()
     settings.auto_import_metadata = False
+    settings.auto_import_collection = False
     store.save(settings)
     app = create_app(store=store, ipc_dir=tmp_path / "ipc", enable_ipc=False, enable_mpris=False)
 
@@ -181,6 +183,7 @@ def test_stream_proxy_assembles_multiple_upstream_range_chunks(
     store = SettingsStore(config_dir=tmp_path / "cfg")
     settings = store.load()
     settings.auto_import_metadata = False
+    settings.auto_import_collection = False
     store.save(settings)
     app = create_app(store=store, ipc_dir=tmp_path / "ipc", enable_ipc=False, enable_mpris=False)
 
@@ -232,6 +235,7 @@ def test_stream_proxy_returns_silent_wav_for_amarok_on_unavailable_track(tmp_pat
     store = SettingsStore(config_dir=tmp_path / "cfg")
     settings = store.load()
     settings.auto_import_metadata = False
+    settings.auto_import_collection = False
     store.save(settings)
     app = create_app(store=store, ipc_dir=tmp_path / "ipc", enable_ipc=False, enable_mpris=False)
     app.state.resolver.resolve = AsyncMock(side_effect=StreamResolutionError("Region blocked"))
@@ -280,3 +284,180 @@ def test_rate_track_with_amarok_star_scale_updates_cache_and_now_playing(tmp_pat
         assert r2.status_code == 200
         assert r2.json()["amarokRating"] == 6
         assert r2.json()["rating"] == "INDIFFERENT"
+
+
+def _make_synthetic_m4a(path: Path, video_id: str = "Ki7GrRTNYfU", title: str = "Engaña") -> Path:
+    """Create a valid minimal MP4/M4A file tagged with mutagen (contains moov/udta/meta/ilst)."""
+    import struct
+    from mutagen.mp4 import MP4
+
+    def box(btype: bytes, payload: bytes) -> bytes:
+        return struct.pack(">I4s", 8 + len(payload), btype) + payload
+
+    ftyp = box(b"ftyp", b"M4A \x00\x00\x00\x00M4A isommp42")
+    mvhd = box(b"mvhd", b"\x00" * 100)
+    mdhd = box(b"mdhd", b"\x00\x00\x00\x00" + struct.pack(">IIII", 0, 0, 44100, 44100 * 180) + b"\x00\x00\x00\x00")
+    hdlr = box(b"hdlr", b"\x00" * 8 + b"soun" + b"\x00" * 12 + b"SoundHandler\x00")
+    esds = box(
+        b"esds",
+        b"\x00\x00\x00\x00\x03\x19\x00\x01\x00\x04\x11\x40\x15\x00\x00\x00\x00\x01\xf4\x00\x00\x01\xf4\x00\x05\x02\x12\x10\x06\x01\x02",
+    )
+    mp4a = box(
+        b"mp4a",
+        b"\x00" * 6
+        + struct.pack(">H", 1)
+        + b"\x00" * 8
+        + struct.pack(">HH", 2, 16)
+        + b"\x00" * 4
+        + struct.pack(">I", 44100 << 16)
+        + esds,
+    )
+    stsd = box(b"stsd", b"\x00\x00\x00\x00" + struct.pack(">I", 1) + mp4a)
+    stco = box(b"stco", b"\x00\x00\x00\x00" + struct.pack(">I", 0))
+    stbl = box(b"stbl", stsd + stco)
+    minf = box(b"minf", stbl)
+    mdia = box(b"mdia", mdhd + hdlr + minf)
+    trak = box(b"trak", mdia)
+    moov = box(b"moov", mvhd + trak)
+    mdat = box(b"mdat", b"\x00" * 2048)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(ftyp + moov + mdat)
+    m = MP4(str(path))
+    m.add_tags()
+    m.tags["\xa9nam"] = [title]
+    m.tags["\xa9ART"] = ["Gustavo Cerati"]
+    m.tags["\xa9alb"] = ["Bocanada"]
+    m.tags["\xa9cmt"] = [f"ytmusic:{video_id}"]
+    m.save()
+    return path
+
+
+def test_stream_serves_local_offline_cache_first_with_mp4_tag_masking(tmp_path: Path) -> None:
+    from mutagen.mp4 import MP4
+    from amarok_ytmusic.metadata_store import CachedTrack
+    from amarok_ytmusic.server import _find_mp4_tag_box_type_offsets
+    from amarok_ytmusic.stream_resolver import StreamResolutionError
+
+    store = SettingsStore(config_dir=tmp_path / "cfg")
+    cache_dir = tmp_path / "offline_cache"
+    settings = store.load()
+    settings.collection_dir = str(cache_dir)
+    store.save(settings)
+
+    app = create_app(store=store, ipc_dir=tmp_path / "ipc", enable_ipc=False, enable_mpris=False)
+    # Simulate completely offline environment: resolver must NEVER be called for cached tracks
+    app.state.resolver.resolve = AsyncMock(side_effect=StreamResolutionError("Offline — no network"))
+
+    m4a_path = _make_synthetic_m4a(cache_dir / "Gustavo Cerati" / "Bocanada" / "Engaña.m4a", "Ki7GrRTNYfU", "Engaña")
+    raw_disk_bytes = m4a_path.read_bytes()
+    udta_offsets = _find_mp4_tag_box_type_offsets(m4a_path)
+    assert len(udta_offsets) >= 1
+    udta_off = udta_offsets[0]
+    assert raw_disk_bytes[udta_off : udta_off + 4] == b"udta"
+
+    app.state.metadata_store.upsert_metadata(
+        CachedTrack(
+            video_id="Ki7GrRTNYfU",
+            title="Engaña",
+            artist="Gustavo Cerati",
+            album="Bocanada",
+            local_file_path=str(m4a_path),
+        )
+    )
+
+    with TestClient(app) as client:
+        # HEAD works offline with exact file length and cache HIT header
+        r_head = client.head("/stream/Ki7GrRTNYfU")
+        assert r_head.status_code == 200
+        assert r_head.headers["x-amarok-ytmusic-cache"] == "HIT"
+        assert r_head.headers["content-type"] == "audio/mp4"
+        assert int(r_head.headers["content-length"]) == len(raw_disk_bytes)
+
+        # Full GET serves local file with udta masked as 'free' (no tags emitted to GStreamer!)
+        r_full = client.get("/stream/Ki7GrRTNYfU")
+        assert r_full.status_code == 200
+        assert r_full.headers["x-amarok-ytmusic-cache"] == "HIT"
+        assert len(r_full.content) == len(raw_disk_bytes)
+        assert r_full.content[udta_off : udta_off + 4] == b"free"
+
+        # Verify streamed M4A is valid MP4 with 0 embedded tags while disk file still keeps full tags
+        streamed_tmp = tmp_path / "streamed.m4a"
+        streamed_tmp.write_bytes(r_full.content)
+        streamed_mp4 = MP4(str(streamed_tmp))
+        assert streamed_mp4.info.length == pytest.approx(180.0, abs=0.5)
+        assert streamed_mp4.tags is None
+        assert MP4(str(m4a_path)).tags["\xa9nam"] == ["Engaña"]
+
+        # Partial Range request slicing directly across the middle of the 4-byte udta box type
+        r_slice = client.get(
+            "/stream/Ki7GrRTNYfU",
+            headers={"Range": f"bytes={udta_off + 1}-{udta_off + 2}"},
+        )
+        assert r_slice.status_code == 206
+        assert r_slice.content == b"re"
+
+        # Invalid range returns 416
+        r_bad = client.get("/stream/Ki7GrRTNYfU", headers={"Range": f"bytes={len(raw_disk_bytes) + 10}-"})
+        assert r_bad.status_code == 416
+
+        # Upstream resolver was never touched
+        app.state.resolver.resolve.assert_not_called()
+
+
+def test_settings_validates_and_migrates_collection_dir(tmp_path: Path) -> None:
+    from amarok_ytmusic.metadata_store import CachedTrack
+
+    store = SettingsStore(config_dir=tmp_path / "cfg")
+    old_dir = tmp_path / "cache_old"
+    new_dir = tmp_path / "cache_new"
+    settings = store.load()
+    settings.collection_dir = str(old_dir)
+    store.save(settings)
+
+    app = create_app(store=store, ipc_dir=tmp_path / "ipc", enable_ipc=False, enable_mpris=False)
+    old_file = _make_synthetic_m4a(old_dir / "Artist A" / "Album B" / "Song C.m4a", "VidMigrate01", "Song C")
+    app.state.metadata_store.upsert_metadata(
+        CachedTrack(
+            video_id="VidMigrate01",
+            title="Song C",
+            artist="Artist A",
+            album="Album B",
+            local_file_path=str(old_file),
+        )
+    )
+
+    # Reject a regular file path as collection_dir
+    not_a_dir = tmp_path / "regular_file.txt"
+    not_a_dir.write_text("hi", encoding="utf-8")
+
+    with TestClient(app) as client:
+        r_err = client.post("/api/settings", json={"collection_dir": str(not_a_dir)})
+        assert r_err.status_code == 400
+
+        # Migrate to new_dir
+        r_mig = client.post(
+            "/api/settings",
+            json={"collection_dir": str(new_dir), "migrate_collection": True, "max_collection_cache_mb": 0},
+        )
+        assert r_mig.status_code == 200
+        body = r_mig.json()
+        assert body["collectionDir"] == str(new_dir)
+        assert body["maxCollectionCacheMb"] == 0
+        assert body["migration"]["moved"] == 1
+        assert body["migration"]["errors"] == 0
+
+        expected_new = new_dir / "Artist A" / "Album B" / "Song C.m4a"
+        assert expected_new.is_file()
+        assert not old_file.exists()
+        # Empty artist/album subdirs cleaned up
+        assert not (old_dir / "Artist A").exists()
+
+        updated = app.state.metadata_store.get_track("VidMigrate01")
+        assert updated is not None
+        assert updated.local_file_path == str(expected_new)
+
+        # Streaming immediately serves from migrated path offline
+        r_stream = client.head("/stream/VidMigrate01")
+        assert r_stream.status_code == 200
+        assert r_stream.headers["x-amarok-ytmusic-cache"] == "HIT"

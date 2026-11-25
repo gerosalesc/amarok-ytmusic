@@ -146,3 +146,47 @@ async def test_mpris_merges_local_collection_stats_and_refines_score(tmp_path: P
     await monitor._process_snapshot(snap_end)
     assert monitor.state.play_count == 4
     assert monitor.state.score > 82.0
+
+
+async def test_mpris_ignores_transient_dbus_miss_and_never_double_scrobbles(tmp_path: Path) -> None:
+    store = SettingsStore(config_dir=tmp_path / "cfg")
+    auth = AuthManager(store)
+    auth.is_authenticated = MagicMock(return_value=True)
+    catalog = YTMusicCatalogClient(auth)
+    catalog.report_playback_history = MagicMock(return_value=True)
+    meta_store = MetadataStore(tmp_path / "metadata_cache.db")
+
+    monitor = MPRISMonitor(catalog, auth, metadata_store=meta_store)
+    monitor.query_local_collection_stats_sync = MagicMock(return_value=None)
+
+    playing = NowPlayingState(
+        amarok_running=True,
+        is_ytmusic=True,
+        playback_status="Playing",
+        video_id="pknZlCdgZf4",
+        title="Perdonar Es Divino",
+        url="http://127.0.0.1:18732/stream/pknZlCdgZf4",
+        position_sec=30.0,
+        duration_sec=300.0,
+    )
+    await monitor._process_snapshot(playing)
+    await monitor._process_snapshot(NowPlayingState(**{**playing.__dict__, "position_sec": 35.0}))
+    await asyncio.sleep(0.05)
+    assert catalog.report_playback_history.call_count == 1
+    assert meta_store.get_track("pknZlCdgZf4").play_count == 1
+
+    # Single transient D-Bus timeout (amarok_running=False) must NOT reset scrobble state
+    await monitor._process_snapshot(NowPlayingState(amarok_running=False))
+    await monitor._process_snapshot(NowPlayingState(**{**playing.__dict__, "position_sec": 45.0}))
+    await asyncio.sleep(0.05)
+    assert catalog.report_playback_history.call_count == 1
+    assert meta_store.get_track("pknZlCdgZf4").play_count == 1
+
+    # Even two consecutive D-Bus misses (full reset) followed by same track mid-song must NOT double-scrobble
+    await monitor._process_snapshot(NowPlayingState(amarok_running=False))
+    await monitor._process_snapshot(NowPlayingState(amarok_running=False))
+    await monitor._process_snapshot(NowPlayingState(**{**playing.__dict__, "position_sec": 55.0}))
+    await monitor._process_snapshot(NowPlayingState(**{**playing.__dict__, "position_sec": 60.0}))
+    await asyncio.sleep(0.05)
+    assert catalog.report_playback_history.call_count == 1
+    assert meta_store.get_track("pknZlCdgZf4").play_count == 1

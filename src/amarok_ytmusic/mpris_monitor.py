@@ -161,6 +161,9 @@ class MPRISMonitor:
         self.state = NowPlayingState()
         self._task: asyncio.Task[None] | None = None
         self._stop_event = asyncio.Event()
+        self._lock = asyncio.Lock()
+        self._last_refresh_at: float = 0.0
+        self._consecutive_dbus_misses: int = 0
 
         # Track per-play listening duration, score baseline & rating baseline
         self._active_vid: str = ""
@@ -171,6 +174,8 @@ class MPRISMonitor:
         self._pre_play_score: float = 0.0
         self._last_score_milestone: float = 0.0
         self._scrobbled_current: bool = False
+        self._last_scrobbled_vid: str = ""
+        self._last_scrobbled_at: float = 0.0
         self._last_seen_rating: float | None = None
         self._last_synced_like: str = ""
         self._local_lookup_ts: dict[str, float] = {}
@@ -243,10 +248,15 @@ class MPRISMonitor:
             log.warning("MPRIS2 command %s failed: %s", command, exc)
             return False
 
-    async def refresh_once(self) -> NowPlayingState:
-        snap = await asyncio.to_thread(self.read_mpris_snapshot_sync)
-        await self._process_snapshot(snap)
-        return self.state
+    async def refresh_once(self, force: bool = False) -> NowPlayingState:
+        async with self._lock:
+            now_mono = time.monotonic()
+            if not force and self.state.amarok_running and (now_mono - self._last_refresh_at) < 0.4:
+                return self.state
+            snap = await asyncio.to_thread(self.read_mpris_snapshot_sync)
+            await self._process_snapshot(snap)
+            self._last_refresh_at = time.monotonic()
+            return self.state
 
     def query_local_collection_stats_sync(
         self,
@@ -383,6 +393,14 @@ class MPRISMonitor:
     async def _process_snapshot(self, snap: NowPlayingState) -> None:
         now = time.time()
 
+        # Ignore a single transient D-Bus timeout while Amarok is busy so we don't wipe active scrobble state
+        if not snap.amarok_running and self._active_vid:
+            self._consecutive_dbus_misses += 1
+            if self._consecutive_dbus_misses < 2:
+                return
+        else:
+            self._consecutive_dbus_misses = 0
+
         # Reset per-track tracking when video_id changes
         if snap.video_id != self._active_vid:
             # Finalize previous track's Amarok score using actual fraction listened
@@ -471,12 +489,20 @@ class MPRISMonitor:
                 self._accumulated_play_sec,
                 snap.position_sec if snap.playback_status == "Playing" else 0.0,
             )
+            recently_scrobbled_same_pos = (
+                snap.video_id == self._last_scrobbled_vid
+                and (now - self._last_scrobbled_at) < 120.0
+                and snap.position_sec > 20.0
+            )
             if (
                 not self._scrobbled_current
+                and not recently_scrobbled_same_pos
                 and snap.playback_status == "Playing"
                 and effective_listened >= SCROBBLE_THRESHOLD_SECONDS
             ):
                 self._scrobbled_current = True
+                self._last_scrobbled_vid = snap.video_id
+                self._last_scrobbled_at = now
                 if self.metadata_store:
                     frac = (self._max_position_sec / self._active_duration_sec) if self._active_duration_sec > 0 else 1.0
                     self._last_score_milestone = max(0.5, min(1.0, frac))

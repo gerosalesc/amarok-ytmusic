@@ -20,7 +20,7 @@ from pydantic import BaseModel
 
 from .ampache_bridge import AmpacheBridge
 from .auth import AuthError, AuthManager, detect_browsers
-from .config import SettingsStore, get_ipc_dir
+from .config import SettingsStore, configure_ipv4_preference, get_ipc_dir, validate_cache_dir
 from .ipc_watcher import IPCWatcher
 from .metadata_store import (
     CachedUserProfile,
@@ -89,6 +89,7 @@ class SettingsUpdateRequest(BaseModel):
     auto_import_collection: bool | None = None
     collection_dir: str | None = None
     max_collection_cache_mb: int | None = None
+    migrate_collection: bool = False
 
 
 class RateTrackRequest(BaseModel):
@@ -100,53 +101,188 @@ class MPRISControlRequest(BaseModel):
     command: str
 
 
-def _serve_local_file_with_range(file_path: Path, request: Request) -> Response:
-    """Serve a locally cached audio file with HTTP Range (206 Partial Content) support."""
-    file_size = file_path.stat().st_size
-    media_type = mimetypes.guess_type(str(file_path))[0] or "audio/mp4"
-    range_header = request.headers.get("range")
+_EXT_MIME_MAP = {
+    ".m4a": "audio/mp4",
+    ".mp4": "audio/mp4",
+    ".webm": "audio/webm",
+    ".opus": "audio/ogg",
+    ".ogg": "audio/ogg",
+    ".mp3": "audio/mpeg",
+    ".flac": "audio/flac",
+}
 
-    start = 0
-    end = file_size - 1
-    status_code = 200
-    headers: dict[str, str] = {
-        "Accept-Ranges": "bytes",
-        "Cache-Control": "no-store",
-    }
 
-    if range_header and range_header.startswith("bytes="):
-        spec = range_header.replace("bytes=", "", 1).split(",")[0].strip()
-        if "-" in spec:
-            start_s, end_s = spec.split("-", 1)
-            if start_s:
-                start = int(start_s)
-                end = int(end_s) if end_s else file_size - 1
-            elif end_s:
-                suffix = int(end_s)
-                start = max(0, file_size - suffix)
-                end = file_size - 1
-            if start >= file_size or start > end:
-                return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
-            end = min(end, file_size - 1)
-            status_code = 206
-            headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+def _media_type_for_path(file_path: Path) -> str:
+    ext = file_path.suffix.lower()
+    if ext in _EXT_MIME_MAP:
+        return _EXT_MIME_MAP[ext]
+    return mimetypes.guess_type(str(file_path))[0] or "audio/mp4"
 
-    length = end - start + 1
-    headers["Content-Length"] = str(length)
 
-    if request.method == "HEAD":
-        return Response(status_code=status_code, headers=headers, media_type=media_type)
+def _walk_mp4_boxes(fh: Any, start: int, end: int) -> list[tuple[int, int, int, bytes]]:
+    """Parse ISO/IEC 14496-12 MP4 box headers within [start, end) -> (offset, header_size, size, box_type)."""
+    boxes: list[tuple[int, int, int, bytes]] = []
+    pos = start
+    while pos + 8 <= end:
+        fh.seek(pos)
+        hdr = fh.read(8)
+        if len(hdr) < 8:
+            break
+        size, btype = struct.unpack(">I4s", hdr)
+        header_size = 8
+        if size == 1:
+            ext = fh.read(8)
+            if len(ext) < 8:
+                break
+            size = struct.unpack(">Q", ext)[0]
+            header_size = 16
+        elif size == 0:
+            size = end - pos
+        if size < header_size or pos + size > end:
+            break
+        boxes.append((pos, header_size, size, btype))
+        pos += size
+    return boxes
+
+
+def _find_mp4_tag_box_type_offsets_fh(fh: Any, file_size: int) -> list[int]:
+    """Locate 4-byte box-type offsets of MP4 udta/meta tag atoms for on-the-fly 'free' masking.
+
+    Replacing 'udta'/'meta' with 'free' in the HTTP response stream preserves exact byte length and
+    stco/co64 offsets while preventing Amarok's GStreamer MetaStream::Track from seeing embedded
+    metadata tags and resetting HTTP stream duration to 0:00. The file on disk is never modified.
+    """
+    if file_size < 16:
+        return []
+    top_boxes = _walk_mp4_boxes(fh, 0, file_size)
+    if not any(btype in (b"ftyp", b"moov") for _, _, _, btype in top_boxes):
+        return []
+    offsets: list[int] = []
+    for pos, hdr_sz, sz, btype in top_boxes:
+        if btype in (b"udta", b"meta"):
+            offsets.append(pos + 4)
+        elif btype == b"moov":
+            for c_pos, _c_hdr, _c_sz, c_type in _walk_mp4_boxes(fh, pos + hdr_sz, pos + sz):
+                if c_type in (b"udta", b"meta"):
+                    offsets.append(c_pos + 4)
+    return sorted(offsets)
+
+
+def _find_mp4_tag_box_type_offsets(file_path: Path) -> list[int]:
+    """Locate 4-byte box-type offsets of MP4 udta/meta tag atoms for an M4A/MP4 file on disk."""
+    if file_path.suffix.lower() not in (".m4a", ".mp4"):
+        return []
+    try:
+        with file_path.open("rb") as fh:
+            return _find_mp4_tag_box_type_offsets_fh(fh, os.fstat(fh.fileno()).st_size)
+    except OSError:
+        return []
+
+
+def _apply_mp4_tag_mask(chunk: bytes, chunk_start: int, patch_offsets: list[int]) -> bytes:
+    """Mask any 4-byte udta/meta box types overlapping [chunk_start, chunk_start + len(chunk)) as b'free'."""
+    if not patch_offsets:
+        return chunk
+    chunk_end = chunk_start + len(chunk)
+    overlapping = [off for off in patch_offsets if off < chunk_end and (off + 4) > chunk_start]
+    if not overlapping:
+        return chunk
+    buf = bytearray(chunk)
+    replacement = b"free"
+    for off in overlapping:
+        ov_start = max(chunk_start, off)
+        ov_end = min(chunk_end, off + 4)
+        buf[ov_start - chunk_start : ov_end - chunk_start] = replacement[ov_start - off : ov_end - off]
+    return bytes(buf)
+
+
+def _serve_local_file_with_range(
+    file_path: Path,
+    request: Request,
+    *,
+    mask_mp4_tags: bool = True,
+    cache_header: str = "HIT",
+) -> Response:
+    """Serve a locally cached audio file with HTTP Range (206 Partial Content) support.
+
+    Opens the file once up front so concurrent atomic tag rewrites (os.replace) cannot alter the
+    inode or box offsets mid-stream.
+    """
+    fh = file_path.open("rb")
+    try:
+        file_size = os.fstat(fh.fileno()).st_size
+        if file_size <= 0:
+            fh.close()
+            raise HTTPException(status_code=404, detail="Cached audio file is empty")
+        media_type = _media_type_for_path(file_path)
+        patch_offsets = (
+            _find_mp4_tag_box_type_offsets_fh(fh, file_size)
+            if mask_mp4_tags and file_path.suffix.lower() in (".m4a", ".mp4")
+            else []
+        )
+
+        range_header = request.headers.get("range")
+        start = 0
+        end = file_size - 1
+        status_code = 200
+        headers: dict[str, str] = {
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "no-store",
+            "X-Amarok-YTMusic-Cache": cache_header,
+        }
+
+        if range_header and range_header.startswith("bytes="):
+            spec = range_header.replace("bytes=", "", 1).split(",")[0].strip()
+            if "-" in spec:
+                start_s, end_s = spec.split("-", 1)
+                try:
+                    if start_s:
+                        start = int(start_s)
+                        end = int(end_s) if end_s else file_size - 1
+                    elif end_s:
+                        suffix = int(end_s)
+                        start = max(0, file_size - suffix)
+                        end = file_size - 1
+                    else:
+                        start = 0
+                        end = file_size - 1
+                except ValueError:
+                    start = 0
+                    end = file_size - 1
+                else:
+                    if start < 0 or start >= file_size or start > end:
+                        fh.close()
+                        return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
+                    end = min(end, file_size - 1)
+                    status_code = 206
+                    headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+
+        length = end - start + 1
+        headers["Content-Length"] = str(length)
+
+        if request.method == "HEAD":
+            fh.close()
+            return Response(status_code=status_code, headers=headers, media_type=media_type)
+    except Exception:
+        fh.close()
+        raise
 
     def file_iter():
-        with file_path.open("rb") as fh:
+        try:
             fh.seek(start)
             remaining = length
+            cursor = start
             while remaining > 0:
                 chunk = fh.read(min(CHUNK_SIZE, remaining))
                 if not chunk:
                     break
+                if patch_offsets:
+                    chunk = _apply_mp4_tag_mask(chunk, cursor, patch_offsets)
+                cursor += len(chunk)
                 remaining -= len(chunk)
                 yield chunk
+        finally:
+            fh.close()
 
     return StreamingResponse(file_iter(), status_code=status_code, headers=headers, media_type=media_type)
 
@@ -177,7 +313,12 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         nonlocal http_client
+        startup_settings = settings_store.load()
+        use_v4 = startup_settings.use_ipv4_only()
+        configure_ipv4_preference(use_v4)
+        transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0") if use_v4 else None
         http_client = httpx.AsyncClient(
+            transport=transport,
             follow_redirects=True,
             timeout=httpx.Timeout(connect=6.0, read=20.0, write=10.0, pool=6.0),
         )
@@ -188,6 +329,7 @@ def create_app(
         try:
             yield
         finally:
+            await importer.stop()
             if enable_mpris:
                 await mpris.stop()
             if watcher:
@@ -246,13 +388,45 @@ def create_app(
             cached_prof = None if verify else metadata_store.get_user_profile()
             if cached_prof is not None:
                 account = cached_prof.to_dict()
+            elif not verify:
+                # Never block the dashboard when offline: return any cached profile immediately
+                # and refresh in the background if reachable.
+                stale_prof = metadata_store.get_user_profile(max_age=0)
+                if stale_prof is not None:
+                    account = stale_prof.to_dict()
+
+                    async def _bg_refresh_profile() -> None:
+                        try:
+                            info = await asyncio.wait_for(
+                                asyncio.to_thread(auth_manager.verify_account), timeout=6.0
+                            )
+                            _cache_profile_from_info(info, settings.auth_mode)
+                        except Exception:
+                            pass
+
+                    asyncio.create_task(_bg_refresh_profile())
+                else:
+                    try:
+                        account = await asyncio.wait_for(
+                            asyncio.to_thread(auth_manager.verify_account), timeout=3.0
+                        )
+                        _cache_profile_from_info(account, settings.auth_mode)
+                    except (AuthError, asyncio.TimeoutError) as exc:
+                        verify_error = str(exc) or "Timed out contacting YouTube Music (offline?)"
             else:
                 try:
-                    account = await asyncio.to_thread(auth_manager.verify_account)
+                    account = await asyncio.wait_for(
+                        asyncio.to_thread(auth_manager.verify_account), timeout=8.0
+                    )
                     _cache_profile_from_info(account, settings.auth_mode)
+                except asyncio.TimeoutError:
+                    verify_error = "Timed out verifying session with YouTube Music (offline?)"
                 except AuthError as exc:
                     verify_error = str(exc)
 
+        cache_stats = await asyncio.to_thread(metadata_store.disk_stats)
+        cache_stats["cacheDir"] = str(settings.resolved_collection_dir())
+        cache_stats["maxCacheMb"] = settings.max_collection_cache_mb
         return {
             "authenticated": authenticated,
             "authMode": settings.auth_mode,
@@ -268,7 +442,7 @@ def create_app(
             "verifyError": verify_error,
             "browsers": [asdict(b) for b in detect_browsers()],
             "nowPlaying": mpris.state.to_dict(),
-            "cacheStats": metadata_store.stats_summary(),
+            "cacheStats": cache_stats,
         }
 
     @app.post("/api/auth/browser-extract")
@@ -330,6 +504,7 @@ def create_app(
     @app.post("/api/settings")
     async def api_settings(req: SettingsUpdateRequest) -> dict[str, Any]:
         settings = settings_store.load()
+        old_dir = settings.resolved_collection_dir()
         if req.audio_quality is not None:
             if req.audio_quality not in ("best", "opus", "m4a", "medium"):
                 raise HTTPException(status_code=400, detail="Invalid audio_quality option")
@@ -343,27 +518,72 @@ def create_app(
             settings.auto_import_collection = req.auto_import_collection
         if req.collection_dir is not None:
             settings.collection_dir = req.collection_dir.strip()
+            new_dir = settings.resolved_collection_dir()
+            try:
+                validate_cache_dir(new_dir)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         if req.max_collection_cache_mb is not None:
             settings.max_collection_cache_mb = max(0, int(req.max_collection_cache_mb))
         settings_store.save(settings)
+
+        migration: dict[str, Any] | None = None
+        new_dir = settings.resolved_collection_dir()
+        if req.migrate_collection and old_dir.resolve(strict=False) != new_dir.resolve(strict=False):
+            try:
+                migration = await asyncio.to_thread(importer.migrate_cache_dir_sync, old_dir, new_dir)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        cache_stats = await asyncio.to_thread(metadata_store.disk_stats)
+        cache_stats["cacheDir"] = str(new_dir)
+        cache_stats["maxCacheMb"] = settings.max_collection_cache_mb
         return {
             "ok": True,
             "audioQuality": settings.audio_quality,
             "scrobbleHistory": settings.scrobble_history,
             "autoImportMetadata": settings.auto_import_metadata,
             "autoImportCollection": settings.auto_import_collection,
-            "collectionDir": str(settings.resolved_collection_dir()),
+            "collectionDir": str(new_dir),
             "maxCollectionCacheMb": settings.max_collection_cache_mb,
+            "migration": migration,
+            "cacheStats": cache_stats,
         }
 
     @app.get("/api/cache/tracks")
-    async def api_cached_tracks(limit: int = Query(default=100, ge=1, le=500)) -> dict[str, Any]:
-        tracks = await asyncio.to_thread(metadata_store.list_tracks, limit)
+    async def api_cached_tracks(
+        limit: int = Query(default=100, ge=1, le=500),
+        q: str = Query(default=""),
+        offline_only: bool = Query(default=False),
+    ) -> dict[str, Any]:
+        settings = settings_store.load()
+        tracks = await asyncio.to_thread(metadata_store.list_tracks, limit, q, offline_only)
+        stats = await asyncio.to_thread(metadata_store.disk_stats)
+        stats["cacheDir"] = str(settings.resolved_collection_dir())
+        stats["maxCacheMb"] = settings.max_collection_cache_mb
         return {
             "ok": True,
-            "stats": metadata_store.stats_summary(),
+            "stats": stats,
             "items": [t.to_dict() for t in tracks],
         }
+
+    @app.post("/api/cache/scan")
+    async def api_scan_cache() -> dict[str, Any]:
+        settings = settings_store.load()
+        scan = await asyncio.to_thread(importer.scan_cache_dir_sync)
+        stats = await asyncio.to_thread(metadata_store.disk_stats)
+        stats["cacheDir"] = str(settings.resolved_collection_dir())
+        stats["maxCacheMb"] = settings.max_collection_cache_mb
+        return {"ok": True, "scan": scan, "stats": stats}
+
+    @app.post("/api/cache/sync-missing")
+    async def api_sync_missing_cache(limit: int = Query(default=50, ge=1, le=500)) -> dict[str, Any]:
+        settings = settings_store.load()
+        sync = await asyncio.to_thread(importer.sync_missing_tracks_sync, limit)
+        stats = await asyncio.to_thread(metadata_store.disk_stats)
+        stats["cacheDir"] = str(settings.resolved_collection_dir())
+        stats["maxCacheMb"] = settings.max_collection_cache_mb
+        return {"ok": True, "sync": sync, "stats": stats}
 
     @app.post("/api/tracks/{video_id}/import")
     async def api_import_track(video_id: str, refresh: bool = False) -> dict[str, Any]:
@@ -405,7 +625,7 @@ def create_app(
         ok = await asyncio.to_thread(mpris.control_sync, req.command)
         if not ok:
             raise HTTPException(status_code=503, detail="Amarok is not reachable over MPRIS2 D-Bus")
-        state = await mpris.refresh_once()
+        state = await mpris.refresh_once(force=True)
         return {"ok": True, "nowPlaying": state.to_dict()}
 
     @app.post("/api/tracks/{video_id}/rate")
@@ -609,6 +829,17 @@ def create_app(
 
     @app.api_route("/stream/{video_id}", methods=["GET", "HEAD"])
     async def stream_audio(video_id: str, request: Request) -> Response:
+        # 1. Local-cache-first playback: serve directly from the offline cache folder whenever available.
+        # On-the-fly 4-byte MP4 udta/meta -> free masking keeps exact byte offsets/seeking while preventing
+        # Amarok's GStreamer MetaStream::Track from resetting HTTP stream duration to 0:00.
+        local_path = importer.find_local_file(video_id)
+        if local_path is not None:
+            log.debug("Serving %s from local offline cache: %s", video_id, local_path)
+            return _serve_local_file_with_range(
+                local_path, request, mask_mp4_tags=True, cache_header="HIT"
+            )
+
+        # 2. Cache MISS: resolve and proxy upstream YouTube audio
         try:
             stream, total_size, media_type = await _probe_stream_length(video_id)
         except StreamResolutionError as exc:
@@ -622,12 +853,10 @@ def create_app(
                 return skip
             raise HTTPException(status_code=502, detail=f"Upstream network error: {exc}") from exc
 
-        # Kick off background metadata + Local Collection import once the stream resolves cleanly.
-        # Note: Keep /stream/{video_id} streaming raw upstream audio (instead of the tagged local .m4a)
-        # so Amarok's GStreamer MetaStream::Track doesn't misinterpret embedded MP4 tags as a 0:00 live radio stream.
+        # Kick off background metadata + offline audio caching once the stream resolves cleanly.
         if request.method == "GET":
             settings = settings_store.load()
-            if settings.auto_import_metadata:
+            if settings.auto_import_collection or settings.auto_import_metadata:
                 asyncio.create_task(importer.on_track_played(video_id, record_play=False))
 
         range_header = request.headers.get("range")
@@ -644,6 +873,7 @@ def create_app(
                 "Accept-Ranges": "bytes",
                 "Cache-Control": "no-store",
                 "Content-Length": str(expected_len),
+                "X-Amarok-YTMusic-Cache": "MISS",
             }
             if is_partial:
                 resp_headers["Content-Range"] = f"bytes {req_start}-{req_end}/{total_size}"
@@ -670,7 +900,13 @@ def create_app(
                 cursor = req_start + len(first_chunk)
                 while cursor <= req_end:
                     c_end = min(cursor + UPSTREAM_RANGE_CHUNK - 1, req_end)
-                    data, _ = await _fetch_upstream_chunk(video_id, cursor, c_end)
+                    try:
+                        data, _ = await _fetch_upstream_chunk(video_id, cursor, c_end)
+                    except (StreamResolutionError, httpx.HTTPError) as exc:
+                        log.warning(
+                            "Mid-stream chunk %d-%d failed for %s: %s", cursor, c_end, video_id, exc
+                        )
+                        return
                     yield data
                     cursor += len(data)
 
@@ -697,7 +933,11 @@ def create_app(
                 return skip
             raise HTTPException(status_code=502, detail=f"Upstream network error: {exc}") from exc
 
-        fb_headers = {"Accept-Ranges": upstream.headers.get("accept-ranges", "bytes"), "Cache-Control": "no-store"}
+        fb_headers = {
+            "Accept-Ranges": upstream.headers.get("accept-ranges", "bytes"),
+            "Cache-Control": "no-store",
+            "X-Amarok-YTMusic-Cache": "MISS",
+        }
         fb_mime = upstream.headers.get("content-type") or media_type
         if request.method == "HEAD":
             st = upstream.status_code

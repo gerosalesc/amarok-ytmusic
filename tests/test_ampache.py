@@ -261,3 +261,86 @@ def test_ampache_search_by_artist_and_query_normalization(tmp_path: Path) -> Non
         assert len(songs) == 1
         assert songs[0].findtext("title") == "Puente"
         assert songs[0].findtext("artist") == "Gustavo Cerati"
+
+
+def test_ampache_offline_cache_browsing_and_search_fallback(tmp_path: Path) -> None:
+    from amarok_ytmusic.metadata_store import CachedTrack
+
+    store = SettingsStore(config_dir=tmp_path / "cfg")
+    app = create_app(store=store, ipc_dir=tmp_path / "ipc", enable_ipc=False, enable_mpris=False)
+
+    f1 = tmp_path / "puente.m4a"
+    f1.write_bytes(b"A" * 2048)
+    f2 = tmp_path / "engania.m4a"
+    f2.write_bytes(b"B" * 2048)
+
+    app.state.metadata_store.upsert_metadata(
+        CachedTrack(
+            video_id="4F-5KEN3Ljg",
+            title="Puente",
+            artist="Gustavo Cerati",
+            album="Bocanada",
+            duration_sec=274,
+            like_status="LIKE",
+            local_file_path=str(f1),
+        )
+    )
+    app.state.metadata_store.upsert_metadata(
+        CachedTrack(
+            video_id="Ki7GrRTNYfU",
+            title="Engaña",
+            artist="Gustavo Cerati",
+            album="Bocanada",
+            duration_sec=252,
+            like_status="INDIFFERENT",
+            local_file_path=str(f2),
+        )
+    )
+
+    # Simulate completely offline mode (catalog raises errors / returns empty)
+    app.state.auth.is_authenticated = MagicMock(return_value=True)
+    app.state.catalog.search_artists = MagicMock(return_value=[])
+    app.state.catalog.get_root_folders = MagicMock(side_effect=RuntimeError("Offline"))
+    app.state.catalog.get_tracks_for_folder = MagicMock(side_effect=RuntimeError("Offline"))
+
+    with TestClient(app) as client:
+        # 1. Root artists includes Offline Cache (id=4) and cached artist Gustavo Cerati
+        r_art = client.get("/ampache/server/xml.server.php", params={"action": "artists"})
+        artists = ET.fromstring(r_art.text).findall("artist")
+        by_id = {a.attrib["id"]: a.findtext("name") for a in artists}
+        assert by_id["4"] == "⬇ YouTube Music — Offline Cache"
+        cerati_id = next(a.attrib["id"] for a in artists if a.findtext("name") == "Gustavo Cerati")
+
+        # 2. Expand Offline Cache -> All Offline Songs (104) & Offline Liked Songs (105)
+        r_albs = client.get("/ampache/server/xml.server.php", params={"action": "artist_albums", "filter": "4"})
+        albs = ET.fromstring(r_albs.text).findall("album")
+        assert [(a.attrib["id"], a.findtext("name")) for a in albs] == [
+            ("104", "All Offline Songs"),
+            ("105", "Offline Liked Songs"),
+        ]
+
+        # 3. Expand All Offline Songs -> both tracks; Offline Liked Songs -> only Puente
+        r_all = client.get("/ampache/server/xml.server.php", params={"action": "album_songs", "filter": "104"})
+        all_titles = {s.findtext("title") for s in ET.fromstring(r_all.text).findall("song")}
+        assert all_titles == {"Puente — Gustavo Cerati", "Engaña — Gustavo Cerati"}
+
+        r_liked = client.get("/ampache/server/xml.server.php", params={"action": "album_songs", "filter": "105"})
+        liked_songs = ET.fromstring(r_liked.text).findall("song")
+        assert len(liked_songs) == 1
+        assert liked_songs[0].findtext("title") == "Puente — Gustavo Cerati"
+
+        # 4. Bulk artist_songs on a cached artist works cleanly offline
+        r_art_songs = client.get("/ampache/server/xml.server.php", params={"action": "artist_songs", "filter": cerati_id})
+        assert len(ET.fromstring(r_art_songs.text).findall("song")) == 2
+
+        # 5. Offline search falls back to local cached tracks
+        r_s_art = client.get("/ampache/server/xml.server.php", params={"action": "artists", "filter": "puente"})
+        s_aid = ET.fromstring(r_s_art.text).find("artist").attrib["id"]
+        r_s_albs = client.get("/ampache/server/xml.server.php", params={"action": "artist_albums", "filter": s_aid})
+        s_albs = ET.fromstring(r_s_albs.text).findall("album")
+        assert any("Offline Matches" in (a.findtext("name") or "") for a in s_albs)
+
+        r_flat_search = client.get("/ampache/server/xml.server.php", params={"action": "songs", "filter": "puente"})
+        flat_songs = ET.fromstring(r_flat_search.text).findall("song")
+        assert len(flat_songs) == 1
+        assert "Puente" in (flat_songs[0].findtext("title") or "")

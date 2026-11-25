@@ -10,10 +10,12 @@ import threading
 import time
 import urllib.request
 
+from pathlib import Path
+
 import uvicorn
 
 from .auth import AuthError, AuthManager, detect_browsers
-from .config import DEFAULT_HOST, DEFAULT_PORT, SettingsStore
+from .config import DEFAULT_HOST, DEFAULT_PORT, SettingsStore, configure_ipv4_preference, validate_cache_dir
 from .metadata_store import MetadataStore
 from .mpris_monitor import MPRISMonitor
 from .server import create_app
@@ -97,30 +99,50 @@ def cmd_auth(args: argparse.Namespace) -> int:
         return 1
 
 
-def cmd_status(_args: argparse.Namespace) -> int:
+def _format_size_mb(size_bytes: int) -> str:
+    mb = size_bytes / (1024 * 1024)
+    if mb >= 1024:
+        return f"{mb / 1024:.2f} GB"
+    return f"{mb:.1f} MB"
+
+
+def cmd_status(args: argparse.Namespace) -> int:
     store = SettingsStore()
     settings = store.load()
     auth = AuthManager(store)
+    meta_store = MetadataStore(store.metadata_db_path)
+    disk = meta_store.disk_stats()
+    cap_label = "unlimited" if settings.max_collection_cache_mb <= 0 else f"{settings.max_collection_cache_mb} MB"
     print(f"Config dir : {store.config_dir}")
     print(f"Server URL : {settings.base_url}")
     print(f"Auth mode  : {settings.auth_mode} ({settings.browser_source or 'none'})")
     print(f"Quality    : {settings.audio_quality}")
+    print(f"Cache dir  : {settings.resolved_collection_dir()}")
+    print(f"Auto-cache : {'enabled' if settings.auto_import_collection else 'disabled'} (limit: {cap_label})")
+    print(
+        f"Offline    : {disk['offlineFiles']} songs cached ({_format_size_mb(disk['diskUsageBytes'])})"
+        + (f", {disk['missingFiles']} missing audio" if disk["missingFiles"] else "")
+    )
 
     browsers = detect_browsers()
     if browsers:
         print("Browsers   : " + ", ".join(f"{b.id}{'*' if b.available else ''}" for b in browsers))
 
     if auth.is_authenticated():
-        try:
-            info = auth.verify_account()
-            print(f"Account    : {info.get('accountName')} {info.get('channelHandle', '')}")
-        except AuthError as exc:
-            print(f"Account    : ERROR ({exc})")
+        cached_prof = None if getattr(args, "verify", False) else meta_store.get_user_profile(max_age=0)
+        if cached_prof is not None:
+            print(f"Account    : {cached_prof.account_name} {cached_prof.channel_handle}".rstrip())
+        else:
+            try:
+                info = auth.verify_account()
+                print(f"Account    : {info.get('accountName')} {info.get('channelHandle', '')}".rstrip())
+            except AuthError as exc:
+                print(f"Account    : ERROR ({exc})")
     else:
         print("Account    : Not signed in")
 
     try:
-        with urllib.request.urlopen(f"{settings.base_url}/api/status", timeout=1.5) as resp:
+        with urllib.request.urlopen(f"{settings.base_url}/api/status", timeout=2.5) as resp:
             print(f"Daemon     : RUNNING (HTTP {resp.status})")
     except Exception:
         print("Daemon     : STOPPED")
@@ -228,17 +250,102 @@ def cmd_import(args: argparse.Namespace) -> int:
 
 def cmd_cache(args: argparse.Namespace) -> int:
     store = SettingsStore()
+    settings = store.load()
+    auth = AuthManager(store)
     meta_store = MetadataStore(store.metadata_db_path)
-    stats = meta_store.stats_summary()
+    importer = TrackImporter(auth, meta_store)
+
+    settings_changed = False
+    old_dir = settings.resolved_collection_dir()
+
+    if args.enable and args.disable:
+        print("Error: cannot pass both --enable and --disable.", file=sys.stderr)
+        return 1
+    if args.enable:
+        settings.auto_import_collection = True
+        settings_changed = True
+    elif args.disable:
+        settings.auto_import_collection = False
+        settings_changed = True
+
+    if args.limit_mb is not None:
+        settings.max_collection_cache_mb = max(0, int(args.limit_mb))
+        settings_changed = True
+
+    if args.set_dir is not None:
+        raw_dir = args.set_dir.strip()
+        settings.collection_dir = raw_dir
+        target_dir = settings.resolved_collection_dir()
+        try:
+            validate_cache_dir(target_dir)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        settings_changed = True
+
+    if settings_changed:
+        store.save(settings)
+        new_dir = settings.resolved_collection_dir()
+        cap_label = "unlimited" if settings.max_collection_cache_mb <= 0 else f"{settings.max_collection_cache_mb} MB"
+        print(
+            f"Updated offline cache settings -> dir={new_dir}, "
+            f"auto_cache={'enabled' if settings.auto_import_collection else 'disabled'}, limit={cap_label}"
+        )
+        if args.move and args.set_dir is not None and old_dir.resolve(strict=False) != new_dir.resolve(strict=False):
+            mig = importer.migrate_cache_dir_sync(old_dir, new_dir)
+            print(
+                f"Migrated cached files: moved={mig['moved']}, skipped={mig['skipped']}, errors={mig['errors']} "
+                f"({mig['oldDir']} -> {mig['newDir']})"
+            )
+
+    if args.scan:
+        scan = importer.scan_cache_dir_sync()
+        print(
+            f"Scanned {scan['cacheDir']}: {scan['scannedFiles']} audio files, "
+            f"{scan['indexedTracks']} indexed, {scan['prunedMissing']} stale removed "
+            f"({_format_size_mb(scan['totalBytes'])})"
+        )
+
+    if args.sync_missing:
+        sync = importer.sync_missing_tracks_sync(limit=args.limit if args.limit > 0 else 50)
+        print(
+            f"Synced missing tracks: cached={sync['cached']}/{sync['attempted']}, failed={sync['failed']}"
+        )
+        for err in sync["errors"]:
+            print(f"  ! {err['videoId']} ({err['title']}): {err['error']}", file=sys.stderr)
+
+    # If user only performed mutating actions without asking to list, still show concise summary
+    stats = meta_store.disk_stats()
+    cap_label = "unlimited" if settings.max_collection_cache_mb <= 0 else f"{settings.max_collection_cache_mb} MB"
     print(
-        f"Cached tracks: {stats['totalTracks']} | In Local Collection: {stats['localFiles']} | "
+        f"Cache folder : {settings.resolved_collection_dir()} "
+        f"(auto-cache={'on' if settings.auto_import_collection else 'off'}, limit={cap_label})"
+    )
+    print(
+        f"Cached tracks: {stats['totalTracks']} | Offline audio: {stats['offlineFiles']} "
+        f"({_format_size_mb(stats['diskUsageBytes'])}) | Missing: {stats['missingFiles']} | "
         f"Liked: {stats['likedCached']} | Total plays: {stats['totalPlays']}"
     )
-    tracks = meta_store.list_tracks(limit=args.limit)
-    for t in tracks:
-        like_s = "♥" if t.like_status == "LIKE" else " "
-        local_s = "[local]" if t.local_file_path else "[meta] "
-        print(f"  {like_s} {local_s} {t.video_id}  {t.title} — {t.artist} [{t.album}] (plays={t.play_count}, score={int(t.score)})")
+
+    if not (args.set_dir is not None or args.limit_mb is not None or args.enable or args.disable or args.scan or args.sync_missing) or args.search or args.offline_only:
+        tracks = meta_store.list_tracks(limit=args.limit, query=args.search or "", offline_only=args.offline_only)
+        for t in tracks:
+            like_s = "♥" if t.like_status == "LIKE" else " "
+            fsize = 0
+            has_file = False
+            if t.local_file_path:
+                try:
+                    st = Path(t.local_file_path).stat()
+                    if st.st_size > 1000:
+                        has_file = True
+                        fsize = st.st_size
+                except OSError:
+                    pass
+            local_s = f"[offline {fsize / (1024 * 1024):4.1f}M]" if has_file else "[meta only    ]"
+            print(
+                f"  {like_s} {local_s} {t.video_id}  {t.title} — {t.artist} [{t.album}] "
+                f"(plays={t.play_count}, score={int(t.score)})"
+            )
     return 0
 
 
@@ -264,6 +371,7 @@ def main(argv: list[str] | None = None) -> int:
     p_auth.set_defaults(func=cmd_auth)
 
     p_status = sub.add_parser("status", help="Show daemon and YouTube Music authentication status")
+    p_status.add_argument("--verify", action="store_true", help="Verify account credentials live with YouTube Music")
     p_status.set_defaults(func=cmd_status)
 
     p_now = sub.add_parser("now", help="Show the currently playing YouTube Music track in Amarok via MPRIS2")
@@ -285,11 +393,24 @@ def main(argv: list[str] | None = None) -> int:
     p_import.add_argument("--refresh", action="store_true", help="Force re-fetching metadata from YouTube Music")
     p_import.set_defaults(func=cmd_import)
 
-    p_cache = sub.add_parser("cache", help="List auto-imported & cached YouTube Music tracks and playback stats")
-    p_cache.add_argument("--limit", type=int, default=30, help="Maximum tracks to display")
+    p_cache = sub.add_parser("cache", help="Configure, scan, migrate, and list the offline song cache")
+    p_cache.add_argument("--set-dir", help="Set the configurable offline cache folder path (use '' to reset to default)")
+    p_cache.add_argument("--move", action="store_true", help="Move existing cached audio files when changing --set-dir")
+    p_cache.add_argument("--limit-mb", type=int, help="Set max cache size in MB (0 = unlimited / keep every song)")
+    p_cache.add_argument("--enable", action="store_true", help="Enable automatic offline caching of every listened song")
+    p_cache.add_argument("--disable", action="store_true", help="Disable automatic offline caching")
+    p_cache.add_argument("--scan", action="store_true", help="Scan & index cached audio files in the configured folder")
+    p_cache.add_argument("--sync-missing", action="store_true", help="Download audio for previously played tracks missing local files")
+    p_cache.add_argument("--offline-only", action="store_true", help="Only list tracks currently available offline")
+    p_cache.add_argument("--search", help="Filter cached tracks by title, artist, album, or video ID")
+    p_cache.add_argument("--limit", type=int, default=30, help="Maximum tracks to display or sync")
     p_cache.set_defaults(func=cmd_cache)
 
     args = parser.parse_args(argv)
+    try:
+        configure_ipv4_preference(SettingsStore().load().use_ipv4_only())
+    except Exception:
+        pass
     return int(args.func(args))
 
 

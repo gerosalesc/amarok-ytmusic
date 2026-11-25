@@ -205,6 +205,8 @@ class StreamResolver:
             "socket_timeout": 5,
             "retries": 1,
         }
+        if settings.use_ipv4_only():
+            base_opts["source_address"] = "0.0.0.0"
 
         watch_url = f"https://music.youtube.com/watch?v={video_id}"
         has_cookies = cookies_path.exists()

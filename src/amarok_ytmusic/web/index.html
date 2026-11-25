@@ -425,10 +425,31 @@
       </div>
     </section>
 
-    <!-- Playback & Settings -->
+    <!-- Playback & Offline Cache Settings -->
     <section class="card">
-      <h2>Audio Quality, Auto-Import &amp; Scrobbling</h2>
+      <h2>
+        <span>Offline Song Cache &amp; Playback Settings</span>
+        <span class="pill" id="diskUsagePill" style="font-size:0.78rem;padding:4px 10px;">0 MB cached</span>
+      </h2>
+      <p class="subtitle" style="margin-bottom:14px;">
+        Every song you listen to is automatically saved as a tagged <code>.m4a</code> in your configurable cache folder and replayed directly from disk on <code>/stream/&lt;videoId&gt;</code> — zero bandwidth and full offline support in Amarok playlists, Ampache, and Local Collection.
+      </p>
       <div class="row">
+        <div>
+          <label for="autoCollectionSelect">Auto-Cache Every Listened Song Offline</label>
+          <select id="autoCollectionSelect">
+            <option value="true">Enabled (save tagged .m4a for offline playback)</option>
+            <option value="false">Disabled (stream online only)</option>
+          </select>
+        </div>
+        <div>
+          <label for="collectionDirInput">Offline Cache Folder</label>
+          <input id="collectionDirInput" placeholder="~/Music/YouTube Music" />
+        </div>
+        <div>
+          <label for="maxCacheMbInput">Max Cache Size (MB, 0 = unlimited)</label>
+          <input id="maxCacheMbInput" type="number" min="0" value="0" />
+        </div>
         <div>
           <label for="qualitySelect">Preferred Stream Quality (GStreamer)</label>
           <select id="qualitySelect">
@@ -452,40 +473,42 @@
             <option value="false">Disabled</option>
           </select>
         </div>
-        <div>
-          <label for="autoCollectionSelect">Auto-Import Tagged M4A to Amarok Local Collection</label>
-          <select id="autoCollectionSelect">
-            <option value="true">Enabled (full Cover Art, Stars, Play Count &amp; Score in Amarok)</option>
-            <option value="false">Disabled (metadata SQLite cache only)</option>
-          </select>
-        </div>
-        <div>
-          <label for="collectionDirInput">Amarok Collection Import Folder</label>
-          <input id="collectionDirInput" placeholder="~/Music/YouTube Music" />
-        </div>
-        <div>
-          <label for="maxCacheMbInput">Max Audio Cache Size (MB, 0 = unlimited)</label>
-          <input id="maxCacheMbInput" type="number" min="0" value="2048" />
-        </div>
+      </div>
+      <div style="margin-top:6px;">
+        <label style="display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-weight:500;color:var(--text);">
+          <input id="migrateCollectionCheck" type="checkbox" style="width:auto;margin:0;" />
+          <span>Move existing cached audio files when changing the Offline Cache Folder</span>
+        </label>
       </div>
       <div class="actions">
         <button class="primary" onclick="saveSettings()">Save Settings</button>
+        <button class="secondary" id="btnScanCache" onclick="scanCacheFolder()">🔍 Scan / Re-index Folder</button>
+        <button class="secondary" id="btnSyncMissing" onclick="syncMissingCache()">⬇ Cache Missing Songs</button>
         <button class="secondary" onclick="clearCache()">Clear Memory Cache</button>
       </div>
       <div class="banner" id="settingsBanner"></div>
     </section>
 
-    <!-- Auto-Imported & Cached Library -->
+    <!-- Offline Song Cache & Library -->
     <section class="card">
       <h2>
-        <span>Auto-Imported &amp; Cached Library</span>
+        <span>Offline Cached Library</span>
         <span class="pill" id="cacheSummaryPill" style="font-size:0.78rem;padding:4px 10px;">0 tracks</span>
       </h2>
       <p class="subtitle" style="margin-bottom:10px;">
-        Played songs automatically import full artist, album, year, cover art, lyrics, Like rating, play count, and score — and sync tagged <code>.m4a</code> files into Amarok's watched Local Collection folder.
+        Browse, search, and play your cached songs directly from disk — even completely offline. Inside Amarok, look under <strong>Local Collection</strong> or <strong>Internet → Ampache → ⬇ YouTube Music — Offline Cache</strong>.
       </p>
       <div class="actions" style="margin-top:0;margin-bottom:10px;">
-        <button class="secondary" onclick="loadCachedTracks()">↻ Refresh Cached Library</button>
+        <input id="cacheFilterInput" placeholder="Filter cached songs by title, artist, or album…" style="flex:1;min-width:200px;" onkeydown="if(event.key==='Enter') loadCachedTracks()" />
+        <label style="display:inline-flex;align-items:center;gap:6px;margin:0;cursor:pointer;color:var(--text);font-weight:500;">
+          <input id="cacheOfflineOnlyCheck" type="checkbox" style="width:auto;margin:0;" onchange="loadCachedTracks()" />
+          <span>Offline only</span>
+        </label>
+        <button class="secondary" onclick="loadCachedTracks()">↻ Refresh</button>
+      </div>
+      <div id="cachePlayerWrap" style="display:none;margin-bottom:10px;padding:10px 12px;border-radius:8px;background:var(--surface-2);border:1px solid var(--border);">
+        <div id="cachePlayerLabel" style="font-size:0.86rem;font-weight:600;margin-bottom:6px;color:var(--kde-blue);"></div>
+        <audio id="cacheAudioPlayer" controls style="display:block;margin-top:0;"></audio>
       </div>
       <div class="track-list" id="cachedTrackList"></div>
     </section>
@@ -610,6 +633,9 @@
         if (typeof data.maxCollectionCacheMb === "number") {
           document.getElementById("maxCacheMbInput").value = data.maxCollectionCacheMb;
         }
+        if (data.cacheStats) {
+          updateDiskUsagePill(data.cacheStats);
+        }
         if (data.nowPlaying) {
           renderNowPlaying(data.nowPlaying);
         }
@@ -665,7 +691,7 @@
       }
       const scrobbleTag = np.scrobbled ? " • Scrobbled ✓" : "";
       const likeTag = np.like_status === "LIKE" ? " • ♥ Liked" : (np.like_status === "DISLIKE" ? " • 👎 Disliked" : "");
-      const localTag = np.has_local_file ? " • In Local Collection ✓" : "";
+      const localTag = np.has_local_file ? " • Cached Offline ✓" : "";
       badge.textContent = `${np.playback_status} (${fmtTime(np.position_sec)} / ${fmtTime(np.duration_sec)})`;
       title.textContent = np.title || np.video_id;
       const artistAlbum = [np.artist, np.album, np.year ? String(np.year) : ""].filter(Boolean).join(" — ");
@@ -673,16 +699,31 @@
       stats.textContent = `Plays: ${np.play_count || 0} • Score: ${Math.round(np.score || 0)}${likeTag}${scrobbleTag}${localTag}`;
     }
 
+    function fmtSizeBytes(bytes) {
+      const mb = (bytes || 0) / (1024 * 1024);
+      if (mb >= 1024) return (mb / 1024).toFixed(2) + " GB";
+      return mb.toFixed(1) + " MB";
+    }
+
+    function updateDiskUsagePill(st) {
+      const pill = document.getElementById("diskUsagePill");
+      if (!pill || !st) return;
+      const files = st.offlineFiles !== undefined ? st.offlineFiles : (st.localFiles || 0);
+      const sizeStr = fmtSizeBytes(st.diskUsageBytes || 0);
+      const cap = st.maxCacheMb > 0 ? ` / ${st.maxCacheMb} MB` : " • Unlimited";
+      pill.textContent = `${files} offline • ${sizeStr}${cap}`;
+    }
+
     async function importCurrentTrack() {
       if (!currentNpVideoId) {
         showBanner("npBanner", "info", "Play a YouTube Music track in Amarok first.");
         return;
       }
-      showBanner("npBanner", "info", "Importing metadata, cover art, lyrics, and tagged M4A to Amarok Local Collection…");
+      showBanner("npBanner", "info", "Caching metadata, cover art, lyrics, and tagged .m4a offline…");
       try {
         const res = await api("/api/tracks/" + encodeURIComponent(currentNpVideoId) + "/import?refresh=true", { method: "POST" });
         const t = res.track || {};
-        showBanner("npBanner", "ok", `Imported "${t.title}" — ${t.artist} [${t.album}]${t.hasLocalFile ? " into Amarok Local Collection!" : ""}`);
+        showBanner("npBanner", "ok", `Cached "${t.title}" — ${t.artist} [${t.album}]${t.hasLocalFile ? " offline!" : ""}`);
         await pollNowPlaying();
         await loadCachedTracks();
       } catch (err) {
@@ -693,13 +734,20 @@
     async function loadCachedTracks() {
       const list = document.getElementById("cachedTrackList");
       const pill = document.getElementById("cacheSummaryPill");
+      const q = (document.getElementById("cacheFilterInput")?.value || "").trim();
+      const offlineOnly = Boolean(document.getElementById("cacheOfflineOnlyCheck")?.checked);
       try {
-        const data = await api("/api/cache/tracks?limit=50");
+        const params = new URLSearchParams({ limit: "100" });
+        if (q) params.set("q", q);
+        if (offlineOnly) params.set("offline_only", "true");
+        const data = await api("/api/cache/tracks?" + params.toString());
         const st = data.stats || {};
-        pill.textContent = `${st.totalTracks || 0} tracks • ${st.localFiles || 0} in Collection • ${st.totalPlays || 0} plays`;
+        const offlineCount = st.offlineFiles !== undefined ? st.offlineFiles : (st.localFiles || 0);
+        pill.textContent = `${offlineCount}/${st.totalTracks || 0} offline • ${fmtSizeBytes(st.diskUsageBytes || 0)} • ${st.totalPlays || 0} plays`;
+        updateDiskUsagePill(st);
         list.innerHTML = "";
         if (!data.items || !data.items.length) {
-          list.innerHTML = "<div class='subtitle'>No tracks cached yet. Play any YouTube Music track in Amarok to auto-import it!</div>";
+          list.innerHTML = "<div class='subtitle'>No matching cached tracks. Play any YouTube Music track to cache it offline automatically!</div>";
           return;
         }
         for (const t of data.items) {
@@ -707,8 +755,12 @@
           row.className = "track-item";
           const imgSrc = t.cover_local_path ? ("/cover/" + encodeURIComponent(t.video_id)) : (t.cover_url || "");
           const likeBadge = t.like_status === "LIKE" ? " ♥" : "";
-          const localBadge = t.hasLocalFile ? " • Local ✓" : "";
+          const sizeLabel = t.fileSizeBytes ? ` (${fmtSizeBytes(t.fileSizeBytes)})` : "";
+          const localBadge = t.hasLocalFile ? ` • Offline ✓${sizeLabel}` : " • Metadata only";
           const lastPlayed = t.last_played ? new Date(t.last_played * 1000).toLocaleString() : "Never";
+          if (t.local_file_path) {
+            row.title = t.local_file_path;
+          }
           row.innerHTML = `
             <div class="track-meta">
               <img class="track-thumb" src="${imgSrc}" alt="" />
@@ -718,16 +770,35 @@
                 <div class="track-sub" style="color:var(--kde-blue);"></div>
               </div>
             </div>
-            <button class="secondary">↻ Sync</button>
+            <div style="display:flex;gap:6px;flex-shrink:0;">
+              <button class="secondary btn-play" title="Play directly from local offline cache">▶ Play</button>
+              <button class="secondary btn-sync" title="Download or refresh cached audio &amp; tags"></button>
+            </div>
           `;
           row.querySelector(".track-title").textContent = `${t.title || t.video_id}${likeBadge}`;
           row.querySelectorAll(".track-sub")[0].textContent = `${t.artist || "Unknown"} — ${t.album || "YouTube Music"}${t.year ? " (" + t.year + ")" : ""}`;
           row.querySelectorAll(".track-sub")[1].textContent = `Plays: ${t.play_count} • Score: ${Math.round(t.score)} • Last played: ${lastPlayed}${localBadge}`;
-          row.querySelector("button").onclick = async () => {
+          const playBtn = row.querySelector(".btn-play");
+          playBtn.onclick = () => {
+            const wrap = document.getElementById("cachePlayerWrap");
+            const label = document.getElementById("cachePlayerLabel");
+            const audio = document.getElementById("cacheAudioPlayer");
+            wrap.style.display = "block";
+            label.textContent = `${t.hasLocalFile ? "Playing from offline cache" : "Streaming"}: ${t.title || t.video_id} — ${t.artist || ""}`;
+            audio.src = "/stream/" + encodeURIComponent(t.video_id);
+            audio.play().catch(() => {});
+          };
+          const syncBtn = row.querySelector(".btn-sync");
+          syncBtn.textContent = t.hasLocalFile ? "↻ Sync" : "⬇ Cache";
+          syncBtn.onclick = async () => {
+            syncBtn.disabled = true;
             try {
               await api("/api/tracks/" + encodeURIComponent(t.video_id) + "/import?refresh=true", { method: "POST" });
               await loadCachedTracks();
-            } catch (_) {}
+            } catch (_) {
+            } finally {
+              syncBtn.disabled = false;
+            }
           };
           list.appendChild(row);
         }
@@ -882,8 +953,12 @@
     }
 
     async function saveSettings() {
+      const migrate = Boolean(document.getElementById("migrateCollectionCheck")?.checked);
+      if (migrate) {
+        showBanner("settingsBanner", "info", "Saving settings and migrating cached audio files…");
+      }
       try {
-        await api("/api/settings", {
+        const res = await api("/api/settings", {
           method: "POST",
           body: JSON.stringify({
             audio_quality: document.getElementById("qualitySelect").value,
@@ -891,18 +966,73 @@
             auto_import_metadata: document.getElementById("autoMetaSelect").value === "true",
             auto_import_collection: document.getElementById("autoCollectionSelect").value === "true",
             collection_dir: document.getElementById("collectionDirInput").value.trim(),
-            max_collection_cache_mb: parseInt(document.getElementById("maxCacheMbInput").value || "2048", 10),
+            max_collection_cache_mb: parseInt(document.getElementById("maxCacheMbInput").value || "0", 10),
+            migrate_collection: migrate,
           }),
         });
-        showBanner("settingsBanner", "ok", "Settings saved.");
+        document.getElementById("collectionDirInput").value = res.collectionDir || "";
+        document.getElementById("migrateCollectionCheck").checked = false;
+        if (res.cacheStats) updateDiskUsagePill(res.cacheStats);
+        let msg = `Settings saved. Offline cache folder: ${res.collectionDir}`;
+        if (res.migration) {
+          msg += ` (migrated ${res.migration.moved} files` + (res.migration.errors ? `, ${res.migration.errors} errors` : "") + ")";
+        }
+        showBanner("settingsBanner", "ok", msg);
+        await loadCachedTracks();
       } catch (err) {
         showBanner("settingsBanner", "err", err.message);
       }
     }
 
+    async function scanCacheFolder() {
+      const btn = document.getElementById("btnScanCache");
+      btn.disabled = true;
+      showBanner("settingsBanner", "info", "Scanning offline cache folder for audio files…");
+      try {
+        const res = await api("/api/cache/scan", { method: "POST" });
+        const sc = res.scan || {};
+        if (res.stats) updateDiskUsagePill(res.stats);
+        showBanner(
+          "settingsBanner",
+          "ok",
+          `Scanned ${sc.cacheDir}: ${sc.scannedFiles || 0} audio files, ${sc.indexedTracks || 0} indexed, ${sc.prunedMissing || 0} stale removed (${fmtSizeBytes(sc.totalBytes || 0)}).`
+        );
+        await loadCachedTracks();
+      } catch (err) {
+        showBanner("settingsBanner", "err", err.message);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function syncMissingCache() {
+      const btn = document.getElementById("btnSyncMissing");
+      btn.disabled = true;
+      showBanner("settingsBanner", "info", "Downloading any previously played tracks missing from offline cache…");
+      try {
+        const res = await api("/api/cache/sync-missing?limit=50", { method: "POST" });
+        const sy = res.sync || {};
+        if (res.stats) updateDiskUsagePill(res.stats);
+        if ((sy.attempted || 0) === 0) {
+          showBanner("settingsBanner", "ok", "All played tracks are already cached offline!");
+        } else {
+          showBanner(
+            "settingsBanner",
+            sy.failed ? "info" : "ok",
+            `Cached ${sy.cached || 0} of ${sy.attempted || 0} missing tracks` + (sy.failed ? ` (${sy.failed} failed)` : "!")
+          );
+        }
+        await loadCachedTracks();
+      } catch (err) {
+        showBanner("settingsBanner", "err", err.message);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
     async function clearCache() {
       await api("/api/cache/clear", { method: "POST" });
-      showBanner("settingsBanner", "ok", "Catalog and stream URL caches cleared.");
+      showBanner("settingsBanner", "ok", "In-memory catalog and stream URL caches cleared (offline audio files kept).");
     }
 
     async function runTestSearch() {

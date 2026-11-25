@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -60,7 +61,13 @@ class AppSettings:
     auto_import_metadata: bool = True
     auto_import_collection: bool = True
     collection_dir: str = ""  # Defaults to ~/Music/YouTube Music when empty
-    max_collection_cache_mb: int = 2048  # 0 = unlimited
+    max_collection_cache_mb: int = 0  # 0 = unlimited (keep every listened song)
+    prefer_ipv4: bool = True  # Avoid broken/blackholed residential IPv6 stalls to YouTube
+
+    def use_ipv4_only(self) -> bool:
+        if os.environ.get("AMAROK_YTMUSIC_ALLOW_IPV6", "").strip().lower() in ("1", "true", "yes"):
+            return False
+        return bool(self.prefer_ipv4)
 
     @property
     def base_url(self) -> str:
@@ -68,7 +75,10 @@ class AppSettings:
 
     def resolved_collection_dir(self) -> Path:
         if self.collection_dir and self.collection_dir.strip():
-            return Path(self.collection_dir).expanduser()
+            return Path(self.collection_dir.strip()).expanduser()
+        env_dir = os.environ.get("AMAROK_YTMUSIC_CACHE_DIR", "").strip()
+        if env_dir:
+            return Path(env_dir).expanduser()
         return Path.home() / "Music" / "YouTube Music"
 
     def stream_url(self, video_id: str) -> str:
@@ -83,6 +93,32 @@ class AppSettings:
             return "bestaudio[abr<=160]/bestaudio/best"
         # Default "best": prefer clean audio-only containers that GStreamer plays reliably
         return "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best"
+
+
+def validate_cache_dir(path: Path) -> Path:
+    """Ensure the configured offline cache directory exists and is writable."""
+    resolved = path.expanduser()
+    if resolved.exists() and not resolved.is_dir():
+        raise ValueError(f"Cache path exists and is not a directory: {resolved}")
+    try:
+        resolved.mkdir(parents=True, exist_ok=True)
+        probe = resolved / f".amarok_ytmusic_write_test_{os.getpid()}"
+        probe.write_bytes(b"")
+        probe.unlink(missing_ok=True)
+    except OSError as exc:
+        raise ValueError(f"Cache directory is not writable ({resolved}): {exc}") from exc
+    return resolved
+
+
+def configure_ipv4_preference(prefer_ipv4: bool = True) -> None:
+    """Configure urllib3 (used by requests / ytmusicapi) to prefer IPv4 when IPv6 is blackholed."""
+    try:
+        import urllib3.util.connection as uconn
+
+        if prefer_ipv4 and os.environ.get("AMAROK_YTMUSIC_ALLOW_IPV6", "").strip().lower() not in ("1", "true", "yes"):
+            uconn.allowed_gai_family = lambda: socket.AF_INET
+    except Exception:
+        pass
 
 
 class SettingsStore:
